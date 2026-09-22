@@ -1,0 +1,13 @@
+name: Keep bot alive
+
+on:
+  schedule:
+    - cron: '*/12 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping bot server
+        run: curl -sf "${{ secrets.BOT_PUBLIC_URL }}/ping" || echo "Пинг не удался (сервис мог ещё не проснуться) — не критично"
