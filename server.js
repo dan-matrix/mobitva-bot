@@ -52,11 +52,13 @@ const CATEGORIES = [
     { table: 'enhancements', appPath: '/enhancements/', param: 'id', label: '✨ Усиление' },
     { table: 'secret_items_new', appPath: '/secret_items/', param: 'id', label: '🔮 Секретная вещь' },
     { table: 'secret_sets_new', appPath: '/secret_sets/', param: 'set', label: '👘 Секретный сет' },
+    { table: 'secret_set_items_new', appPath: '/secret_sets/', param: 'set', label: '👘 Вещь из сета' },
 ];
 
 // ---- Кэш данных для поиска: перечитываем базу раз в 10 минут,
 //      а не при каждом сообщении, чтобы не дёргать Supabase зря ----
-let searchIndex = null; // Fuse-индекс
+let searchIndex = null; // Fuse-индекс (нечёткий поиск)
+let allEntries = [];    // плоский список всех записей (для точного совпадения)
 
 const REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 
@@ -76,6 +78,7 @@ async function rebuildIndex() {
             console.warn(`! Ошибка при получении "${cat.table}":`, e.message);
         }
     }
+    allEntries = combined;
     searchIndex = new Fuse(combined, {
         keys: ['name'],
         threshold: 0.4,       // чем больше — тем терпимее к опечаткам (0 = точное совпадение, 1 = почти всё подряд)
@@ -189,12 +192,25 @@ async function handleSearch(chatId, query) {
             bot.sendMessage(chatId, 'Секунду, ещё загружаю базу данных — попробуй написать ещё раз через пару секунд.').catch(e => console.error('Ошибка отправки:', e.message));
             return;
         }
-        const results = search(query);
-        if (results.length === 0) {
-            bot.sendMessage(chatId, `Ничего не нашёл по запросу «${query}». Попробуй сформулировать иначе.`).catch(e => console.error('Ошибка отправки:', e.message));
+
+        // Сначала проверяем точное совпадение по названию (без учёта регистра/пробелов).
+        const normalizedQuery = query.trim().toLowerCase();
+        const exactMatches = allEntries.filter(e => e.name && e.name.trim().toLowerCase() === normalizedQuery);
+
+        if (exactMatches.length > 0) {
+            const text = exactMatches.map(formatEntry).join('\n\n———\n\n');
+            bot.sendMessage(chatId, text, { disable_web_page_preview: true }).catch(e => console.error('Ошибка отправки:', e.message));
             return;
         }
-        const text = results.map(formatEntry).join('\n\n———\n\n');
+
+        // Точного совпадения нет — ищем похожее (нечёткий поиск).
+        const results = search(query);
+        if (results.length === 0) {
+            bot.sendMessage(chatId, `Такого нет: «${query}». Похожего тоже ничего не нашёл — попробуй сформулировать иначе.`).catch(e => console.error('Ошибка отправки:', e.message));
+            return;
+        }
+        const text = `Точного совпадения с «${query}» нет, но вот похожее:\n\n` +
+            results.map(formatEntry).join('\n\n———\n\n');
         bot.sendMessage(chatId, text, { disable_web_page_preview: true }).catch(e => console.error('Ошибка отправки:', e.message));
     } catch (e) {
         console.error('Ошибка обработки запроса:', e);
