@@ -107,6 +107,10 @@ app.listen(PORT, () => {
     bot.setWebHook(`${PUBLIC_URL}/webhook`)
         .then(() => console.log('Webhook установлен:', `${PUBLIC_URL}/webhook`))
         .catch(err => console.error('Не удалось установить webhook:', err.message));
+    bot.setMyCommands([
+        { command: 'start', description: 'Помощь и как пользоваться ботом' },
+        { command: 'item', description: 'Поиск: /item <название>' },
+    ]).catch(err => console.error('Не удалось задать список команд:', err.message));
 });
 
 // ---- Форматирование ответа ----
@@ -150,8 +154,15 @@ bot.onText(/^\/start/, (msg) => {
     ).catch(e => console.error('Ошибка отправки:', e.message));
 });
 
-bot.onText(/^\/item(?:@\w+)?\s+(.+)/, async (msg, match) => {
-    await handleSearch(msg.chat.id, match[1].trim());
+bot.onText(/^\/item(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
+    const query = match[1] ? match[1].trim() : '';
+    if (!query) {
+        bot.sendMessage(msg.chat.id, 'Что ищем? Напиши название предмета, руны, тотема и т.д. следующим сообщением:', {
+            reply_markup: { force_reply: true }
+        }).catch(e => console.error('Ошибка отправки:', e.message));
+        return;
+    }
+    await handleSearch(msg.chat.id, query);
 });
 
 // Любое обычное сообщение без команды тоже воспринимаем как поиск
