@@ -154,20 +154,18 @@ bot.onText(/^\/start/, (msg) => {
     ).catch(e => console.error('Ошибка отправки:', e.message));
 });
 
-// Отслеживаем, кому из пользователей в каких чатах бот только что задал
-// вопрос "Что ищем?" — чтобы в группе ответить мог только автор запроса.
-const pendingPrompts = new Map(); // ключ: `${chatId}:${userId}` -> id сообщения-вопроса
-
 bot.onText(/^\/item(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
     const query = match[1] ? match[1].trim() : '';
     if (!query) {
-        const sent = await bot.sendMessage(msg.chat.id, 'Что ищем? Напиши название предмета, руны, тотема и т.д. следующим сообщением:', {
-            reply_markup: { force_reply: true }
-        }).catch(e => { console.error('Ошибка отправки:', e.message); return null; });
-        if (sent) {
-            const key = `${msg.chat.id}:${msg.from.id}`;
-            pendingPrompts.set(key, sent.message_id);
-            setTimeout(() => pendingPrompts.delete(key), 10 * 60 * 1000);
+        if (msg.chat.type === 'private') {
+            bot.sendMessage(msg.chat.id, 'Что ищем? Напиши название предмета, руны, тотема и т.д. следующим сообщением:', {
+                reply_markup: { force_reply: true }
+            }).catch(e => console.error('Ошибка отправки:', e.message));
+        } else {
+            // В группе не задаём отдельный вопрос — его увидели бы все участники.
+            // Вместо этого короткая подсказка, как написать всё одной командой.
+            bot.sendMessage(msg.chat.id, 'В группе пиши сразу вместе с названием, например: /item меч огня')
+                .catch(e => console.error('Ошибка отправки:', e.message));
         }
         return;
     }
@@ -175,24 +173,13 @@ bot.onText(/^\/item(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
 });
 
 // Любое обычное сообщение без команды тоже воспринимаем как поиск —
-// но только в личных чатах с ботом. В группах бота отвечает только тому,
-// кто прямо ответил (reply) на его собственный вопрос "Что ищем?".
+// но только в личных чатах с ботом. В группах ищем только по полной
+// команде /item название, чтобы бот не встревал в чужие разговоры.
 bot.on('message', async (msg) => {
     if (!msg.text) return;
     if (msg.text.startsWith('/')) return; // команды обработаны выше
-
-    if (msg.chat.type === 'private') {
-        await handleSearch(msg.chat.id, msg.text.trim());
-        return;
-    }
-
-    // Групповой чат: реагируем только на настоящий ответ на наш собственный вопрос
-    const key = `${msg.chat.id}:${msg.from.id}`;
-    const expectedPromptId = pendingPrompts.get(key);
-    if (expectedPromptId && msg.reply_to_message && msg.reply_to_message.message_id === expectedPromptId) {
-        pendingPrompts.delete(key);
-        await handleSearch(msg.chat.id, msg.text.trim());
-    }
+    if (msg.chat.type !== 'private') return;
+    await handleSearch(msg.chat.id, msg.text.trim());
 });
 
 async function handleSearch(chatId, query) {
