@@ -110,26 +110,23 @@ app.listen(PORT, () => {
 });
 
 // ---- Форматирование ответа ----
-function escapeMarkdown(text) {
-    return String(text).replace(/([_*[\]()~`>#+=|{}.!-])/g, '\\$1');
-}
 
 function formatEntry(row) {
     const cat = row.__cat;
     const lines = [];
-    lines.push(`${cat.label}: *${escapeMarkdown(row.name || `#${row.id}`)}*`);
-    if (row.level !== undefined && row.level !== null) lines.push(`Уровень: ${row.level}`);
+    lines.push(`${cat.label}: ${row.name || `#${row.id}`}`);
+    if (row.level !== undefined && row.level !== null) lines.push(`⭐ Уровень: ${row.level}`);
     if (row.stats && typeof row.stats === 'object') {
         const statsText = Object.entries(row.stats)
             .filter(([, v]) => v !== null && v !== undefined && v !== '' && v !== 0)
             .map(([k, v]) => `${k}: ${v}`)
             .join(', ');
-        if (statsText) lines.push(escapeMarkdown(statsText));
+        if (statsText) lines.push(statsText);
     }
     if (row.description) {
         let desc = String(row.description);
         if (desc.length > 200) desc = desc.slice(0, 197) + '...';
-        lines.push(`_${escapeMarkdown(desc)}_`);
+        lines.push(desc);
     }
     const linkId = cat.param === 'set' ? (row.set_id ?? row.id) : row.id;
     lines.push(`🔗 ${SITE_URL}${cat.appPath}?${cat.param}=${linkId}&open=modal`);
@@ -150,7 +147,7 @@ bot.onText(/^\/start/, (msg) => {
         'круга демона, наколки, усиления, секретной вещи или сета. ' +
         'Ищу сразу по всей базе, опечатки не страшны.\n\n' +
         `Полная база: ${SITE_URL}`
-    );
+    ).catch(e => console.error('Ошибка отправки:', e.message));
 });
 
 bot.onText(/^\/item(?:@\w+)?\s+(.+)/, async (msg, match) => {
@@ -168,18 +165,18 @@ async function handleSearch(chatId, query) {
     if (!query) return;
     try {
         if (!searchIndex) {
-            bot.sendMessage(chatId, 'Секунду, ещё загружаю базу данных — попробуй написать ещё раз через пару секунд.');
+            bot.sendMessage(chatId, 'Секунду, ещё загружаю базу данных — попробуй написать ещё раз через пару секунд.').catch(e => console.error('Ошибка отправки:', e.message));
             return;
         }
         const results = search(query);
         if (results.length === 0) {
-            bot.sendMessage(chatId, `Ничего не нашёл по запросу «${query}». Попробуй сформулировать иначе.`);
+            bot.sendMessage(chatId, `Ничего не нашёл по запросу «${query}». Попробуй сформулировать иначе.`).catch(e => console.error('Ошибка отправки:', e.message));
             return;
         }
         const text = results.map(formatEntry).join('\n\n———\n\n');
-        bot.sendMessage(chatId, text, { parse_mode: 'Markdown', disable_web_page_preview: true });
+        bot.sendMessage(chatId, text, { disable_web_page_preview: true }).catch(e => console.error('Ошибка отправки:', e.message));
     } catch (e) {
         console.error('Ошибка обработки запроса:', e);
-        bot.sendMessage(chatId, 'Что-то пошло не так при поиске. Попробуй ещё раз чуть позже.');
+        bot.sendMessage(chatId, 'Что-то пошло не так при поиске. Попробуй ещё раз чуть позже.').catch(e => console.error('Ошибка отправки:', e.message));
     }
 }
