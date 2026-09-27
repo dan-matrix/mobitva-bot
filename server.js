@@ -209,44 +209,88 @@ async function getTimerWithAuth(timerId, login) {
 
 function formatRemaining(endTimeMs) {
     const diff = endTimeMs - Date.now();
-    if (diff <= 0) return 'истёк ⚠️';
+    if (diff <= 0) return 'истёк';
     const totalMin = Math.floor(diff / 60000);
     const h = Math.floor(totalMin / 60);
     const m = totalMin % 60;
     return h > 0 ? `${h}ч ${m}м` : `${m}м`;
 }
 
-// Собирает текст + инлайн-кнопки со списком всех таймеров пользователя
-async function buildTimersView(login) {
+// Цветной индикатор срочности: 🟢 много времени, 🟡 меньше часа,
+// 🟠 меньше 10 минут, 🔴 истёк, ⏸️ на паузе
+function statusEmoji(timer) {
+    if (!timer.is_active) return '⏸️';
+    const diff = timer.end_time - Date.now();
+    if (diff <= 0) return '🔴';
+    const min = diff / 60000;
+    if (min <= 10) return '🟠';
+    if (min <= 60) return '🟡';
+    return '🟢';
+}
+
+// Самый "тревожный" статус среди таймеров персонажа — чтобы показать
+// его прямо на кнопке со списком персонажей, не открывая таймеры
+function worstStatus(timers) {
+    if (timers.length === 0) return '⚪';
+    const priority = ['🔴', '🟠', '🟡', '⏸️', '🟢'];
+    const present = new Set(timers.map(statusEmoji));
+    for (const s of priority) if (present.has(s)) return s;
+    return '⚪';
+}
+
+function escapeHtml(text) {
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Экран 1: список персонажей с общим индикатором срочности
+async function buildCharactersView(login) {
     const characters = await getCharactersByLogin(login);
     if (characters.length === 0) {
         return { text: 'У тебя пока нет персонажей на сайте. Создай персонажа в личном кабинете.', keyboard: null };
     }
 
-    const lines = [];
     const buttons = [];
-    let anyTimers = false;
-
     for (const char of characters) {
         const timers = await getTimersForCharacter(char.id);
-        lines.push(`👤 ${char.name}`);
-        if (timers.length === 0) {
-            lines.push('   (нет таймеров)');
-        } else {
-            anyTimers = true;
-            for (const t of timers) {
-                const status = t.is_active ? formatRemaining(t.end_time) : 'на паузе';
-                buttons.push([{ text: `⏱️ ${t.quest_name} (${char.name}) — ${status}`, callback_data: `tl:${t.id}` }]);
-            }
-        }
+        const status = worstStatus(timers);
+        const label = timers.length > 0
+            ? `${status} ${char.name} (${timers.length})`
+            : `⚪ ${char.name} (нет таймеров)`;
+        buttons.push([{ text: label, callback_data: `tc:${char.id}` }]);
     }
-
     buttons.push([{ text: '➕ Добавить таймер', callback_data: 'add' }]);
 
     return {
-        text: anyTimers ? lines.join('\n') : lines.join('\n') + '\n\nНажми кнопку ниже, чтобы добавить таймер.',
+        text: '👤 <b>Выбери персонажа:</b>\n\n🟢 много времени · 🟡 меньше часа · 🟠 скоро истечёт · 🔴 истёк · ⏸️ на паузе',
         keyboard: { inline_keyboard: buttons },
     };
+}
+
+// Экран 2: таймеры одного персонажа
+async function buildCharacterTimersView(login, characterId) {
+    const characters = await getCharactersByLogin(login);
+    const char = characters.find(c => c.id === characterId);
+    if (!char) return { text: 'Персонаж не найден.', keyboard: null };
+
+    const timers = await getTimersForCharacter(characterId);
+    const buttons = [];
+
+    if (timers.length === 0) {
+        buttons.push([{ text: '➕ Добавить таймер', callback_data: 'add' }]);
+    } else {
+        for (const t of timers) {
+            const status = statusEmoji(t);
+            const remaining = t.is_active ? formatRemaining(t.end_time) : 'на паузе';
+            buttons.push([{ text: `${status} ${t.quest_name} — ${remaining}`, callback_data: `tl:${t.id}` }]);
+        }
+    }
+    buttons.push([{ text: '⬅️ Назад к персонажам', callback_data: 'tb' }]);
+
+    const text = timers.length > 0
+        ? `👤 <b>${escapeHtml(char.name)}</b> — таймеры:`
+        : `👤 <b>${escapeHtml(char.name)}</b>\nТаймеров пока нет.`;
+
+    return { text, keyboard: { inline_keyboard: buttons } };
 }
 
 const DURATION_PRESETS = [15, 30, 60, 90, 120, 180];
@@ -266,11 +310,11 @@ function durationKeyboard() {
     return { inline_keyboard: rows };
 }
 
-function timerDetailKeyboard(timerId) {
+function timerDetailKeyboard(timerId, characterId) {
     return {
         inline_keyboard: [
             [{ text: '🔄 Перезапустить', callback_data: `tr:${timerId}` }, { text: '🗑️ Удалить', callback_data: `td:${timerId}` }],
-            [{ text: '⬅️ Назад к списку', callback_data: 'tb' }],
+            [{ text: '⬅️ Назад к таймерам', callback_data: `tc:${characterId}` }],
         ],
     };
 }
@@ -461,8 +505,8 @@ bot.onText(/^\/timers/, async (msg) => {
     if (!requirePrivateChat(msg)) return;
     const login = await requireLinkedLogin(msg.chat.id);
     if (!login) return;
-    const view = await buildTimersView(login);
-    bot.sendMessage(msg.chat.id, view.text, { reply_markup: view.keyboard || undefined }).catch(logSendErr);
+    const view = await buildCharactersView(login);
+    bot.sendMessage(msg.chat.id, view.text, { parse_mode: 'HTML', reply_markup: view.keyboard || undefined }).catch(logSendErr);
 });
 
 async function startTimerAddFlow(chatId, login) {
@@ -541,10 +585,18 @@ bot.on('callback_query', async (query) => {
         return;
     }
 
-    // Вернуться к списку таймеров
+    // Вернуться к списку персонажей
     if (data === 'tb') {
-        const view = await buildTimersView(login);
-        bot.sendMessage(chatId, view.text, { reply_markup: view.keyboard || undefined }).catch(logSendErr);
+        const view = await buildCharactersView(login);
+        bot.sendMessage(chatId, view.text, { parse_mode: 'HTML', reply_markup: view.keyboard || undefined }).catch(logSendErr);
+        return;
+    }
+
+    // Открыть таймеры конкретного персонажа
+    if (data.startsWith('tc:')) {
+        const characterId = parseInt(data.slice(3), 10);
+        const view = await buildCharacterTimersView(login, characterId);
+        bot.sendMessage(chatId, view.text, { parse_mode: 'HTML', reply_markup: view.keyboard || undefined }).catch(logSendErr);
         return;
     }
 
@@ -554,7 +606,10 @@ bot.on('callback_query', async (query) => {
         const timer = await getTimerWithAuth(timerId, login);
         if (!timer) { bot.sendMessage(chatId, 'Таймер не найден.').catch(logSendErr); return; }
         const status = timer.is_active ? formatRemaining(timer.end_time) : 'на паузе';
-        bot.sendMessage(chatId, `⏱️ ${timer.quest_name}\nОсталось: ${status}`, { reply_markup: timerDetailKeyboard(timerId) }).catch(logSendErr);
+        bot.sendMessage(chatId, `${statusEmoji(timer)} <b>${escapeHtml(timer.quest_name)}</b>\nОсталось: ${status}`, {
+            parse_mode: 'HTML',
+            reply_markup: timerDetailKeyboard(timerId, timer.character_id),
+        }).catch(logSendErr);
         return;
     }
 
@@ -563,8 +618,14 @@ bot.on('callback_query', async (query) => {
         const timerId = parseInt(data.slice(3), 10);
         const timer = await getTimerWithAuth(timerId, login);
         if (!timer) { bot.sendMessage(chatId, 'Таймер не найден.').catch(logSendErr); return; }
+        const characterId = timer.character_id;
         const { error } = await supabaseAdmin.from('user_timers').delete().eq('id', timerId);
-        bot.sendMessage(chatId, error ? '❌ Не удалось удалить.' : `🗑️ Таймер «${timer.quest_name}» удалён.`).catch(logSendErr);
+        if (error) { bot.sendMessage(chatId, '❌ Не удалось удалить.').catch(logSendErr); return; }
+        const view = await buildCharacterTimersView(login, characterId);
+        bot.sendMessage(chatId, `🗑️ Таймер «${escapeHtml(timer.quest_name)}» удалён.\n\n${view.text}`, {
+            parse_mode: 'HTML',
+            reply_markup: view.keyboard || undefined,
+        }).catch(logSendErr);
         return;
     }
 
@@ -578,7 +639,11 @@ bot.on('callback_query', async (query) => {
             .from('user_timers')
             .update({ end_time: newEndTime, is_active: true, notified_at: null })
             .eq('id', timerId);
-        bot.sendMessage(chatId, error ? '❌ Не удалось перезапустить.' : `🔄 Таймер «${timer.quest_name}» перезапущен.`).catch(logSendErr);
+        if (error) { bot.sendMessage(chatId, '❌ Не удалось перезапустить.').catch(logSendErr); return; }
+        bot.sendMessage(chatId, `🔄 Таймер «${escapeHtml(timer.quest_name)}» перезапущен.`, {
+            parse_mode: 'HTML',
+            reply_markup: timerDetailKeyboard(timerId, timer.character_id),
+        }).catch(logSendErr);
     }
 });
 
