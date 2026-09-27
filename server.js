@@ -293,7 +293,7 @@ async function buildCharacterTimersView(login, characterId) {
     return { text, keyboard: { inline_keyboard: buttons } };
 }
 
-const DURATION_PRESETS = [15, 30, 60, 90, 120, 180];
+const DURATION_PRESETS = [120, 360, 720, 1440, 2880, 4320, 10080];
 
 function characterKeyboard(characters) {
     return {
