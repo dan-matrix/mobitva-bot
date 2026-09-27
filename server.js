@@ -48,6 +48,14 @@ const supabaseAdmin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
 
 function logSendErr(e) { console.error('Ошибка отправки:', e.message); }
 
+function requirePrivateChat(msg) {
+    if (msg.chat.type !== 'private') {
+        bot.sendMessage(msg.chat.id, '🔒 Управление таймерами работает только в личных сообщениях боту — напиши мне в личку.').catch(logSendErr);
+        return false;
+    }
+    return true;
+}
+
 // ==================== ПОИСК ПО БАЗЕ ====================
 
 const CATEGORIES = [
@@ -208,6 +216,65 @@ function formatRemaining(endTimeMs) {
     return h > 0 ? `${h}ч ${m}м` : `${m}м`;
 }
 
+// Собирает текст + инлайн-кнопки со списком всех таймеров пользователя
+async function buildTimersView(login) {
+    const characters = await getCharactersByLogin(login);
+    if (characters.length === 0) {
+        return { text: 'У тебя пока нет персонажей на сайте. Создай персонажа в личном кабинете.', keyboard: null };
+    }
+
+    const lines = [];
+    const buttons = [];
+    let anyTimers = false;
+
+    for (const char of characters) {
+        const timers = await getTimersForCharacter(char.id);
+        lines.push(`👤 ${char.name}`);
+        if (timers.length === 0) {
+            lines.push('   (нет таймеров)');
+        } else {
+            anyTimers = true;
+            for (const t of timers) {
+                const status = t.is_active ? formatRemaining(t.end_time) : 'на паузе';
+                buttons.push([{ text: `⏱️ ${t.quest_name} (${char.name}) — ${status}`, callback_data: `tl:${t.id}` }]);
+            }
+        }
+    }
+
+    buttons.push([{ text: '➕ Добавить таймер', callback_data: 'add' }]);
+
+    return {
+        text: anyTimers ? lines.join('\n') : lines.join('\n') + '\n\nНажми кнопку ниже, чтобы добавить таймер.',
+        keyboard: { inline_keyboard: buttons },
+    };
+}
+
+const DURATION_PRESETS = [15, 30, 60, 90, 120, 180];
+
+function characterKeyboard(characters) {
+    return {
+        inline_keyboard: characters.map((c, i) => [{ text: c.name, callback_data: `ac:${i}` }]),
+    };
+}
+
+function durationKeyboard() {
+    const rows = [];
+    for (let i = 0; i < DURATION_PRESETS.length; i += 3) {
+        rows.push(DURATION_PRESETS.slice(i, i + 3).map(m => ({ text: `${m} мин`, callback_data: `ad:${m}` })));
+    }
+    rows.push([{ text: '✏️ Другое количество минут', callback_data: 'ad:custom' }]);
+    return { inline_keyboard: rows };
+}
+
+function timerDetailKeyboard(timerId) {
+    return {
+        inline_keyboard: [
+            [{ text: '🔄 Перезапустить', callback_data: `tr:${timerId}` }, { text: '🗑️ Удалить', callback_data: `td:${timerId}` }],
+            [{ text: '⬅️ Назад к списку', callback_data: 'tb' }],
+        ],
+    };
+}
+
 // Состояние пошагового добавления таймера (/timer_add), по одному на чат
 const timerAddState = new Map();
 
@@ -215,58 +282,47 @@ async function handleTimerAddStep(msg) {
     const state = timerAddState.get(msg.chat.id);
     const text = msg.text.trim();
 
-    if (state.step === 'character') {
-        const idx = parseInt(text) - 1;
-        const chosen = state.characters[idx];
-        if (!chosen) {
-            bot.sendMessage(msg.chat.id, 'Не понял номер, напиши цифрой из списка ещё раз.').catch(logSendErr);
-            return;
-        }
-        state.characterId = chosen.id;
-        state.characterName = chosen.name;
-        state.step = 'quest_name';
-        timerAddState.set(msg.chat.id, state);
-        bot.sendMessage(msg.chat.id, 'Напиши название квеста/таймера:', { reply_markup: { force_reply: true } }).catch(logSendErr);
-        return;
-    }
-
     if (state.step === 'quest_name') {
         state.questName = text;
         state.step = 'duration';
         timerAddState.set(msg.chat.id, state);
-        bot.sendMessage(msg.chat.id, 'На сколько минут поставить таймер? (просто число)', { reply_markup: { force_reply: true } }).catch(logSendErr);
+        bot.sendMessage(msg.chat.id, 'На сколько поставить таймер?', { reply_markup: durationKeyboard() }).catch(logSendErr);
         return;
     }
 
-    if (state.step === 'duration') {
+    if (state.step === 'duration_custom') {
         const minutes = parseInt(text.replace(/[^\d]/g, ''), 10);
         if (!minutes || minutes <= 0) {
             bot.sendMessage(msg.chat.id, 'Не понял число минут, напиши ещё раз просто цифрой, например: 90').catch(logSendErr);
             return;
         }
-        const totalMs = minutes * 60 * 1000;
-        const endTime = Date.now() + totalMs;
-
-        const existingTimers = await getTimersForCharacter(state.characterId);
-        const maxOrder = existingTimers.reduce((max, t) => Math.max(max, t.order_index || 0), 0);
-
-        const { error } = await supabaseAdmin.from('user_timers').insert([{
-            character_id: state.characterId,
-            quest_name: state.questName,
-            end_time: endTime,
-            duration: totalMs,
-            notes: '',
-            is_active: true,
-            order_index: maxOrder + 1,
-        }]);
-        timerAddState.delete(msg.chat.id);
-        if (error) {
-            console.error('Ошибка создания таймера:', error.message);
-            bot.sendMessage(msg.chat.id, '❌ Не удалось создать таймер.').catch(logSendErr);
-            return;
-        }
-        bot.sendMessage(msg.chat.id, `✅ Таймер «${state.questName}» на ${minutes} мин добавлен персонажу ${state.characterName}.`).catch(logSendErr);
+        await finishTimerAdd(msg.chat.id, state, minutes);
     }
+}
+
+async function finishTimerAdd(chatId, state, minutes) {
+    const totalMs = minutes * 60 * 1000;
+    const endTime = Date.now() + totalMs;
+
+    const existingTimers = await getTimersForCharacter(state.characterId);
+    const maxOrder = existingTimers.reduce((max, t) => Math.max(max, t.order_index || 0), 0);
+
+    const { error } = await supabaseAdmin.from('user_timers').insert([{
+        character_id: state.characterId,
+        quest_name: state.questName,
+        end_time: endTime,
+        duration: totalMs,
+        notes: '',
+        is_active: true,
+        order_index: maxOrder + 1,
+    }]);
+    timerAddState.delete(chatId);
+    if (error) {
+        console.error('Ошибка создания таймера:', error.message);
+        bot.sendMessage(chatId, '❌ Не удалось создать таймер.').catch(logSendErr);
+        return;
+    }
+    bot.sendMessage(chatId, `✅ Таймер «${state.questName}» на ${minutes} мин добавлен персонажу ${state.characterName}.`).catch(logSendErr);
 }
 
 // ==================== ФОНОВАЯ ПРОВЕРКА ИСТЁКШИХ ТАЙМЕРОВ ====================
@@ -323,10 +379,8 @@ app.listen(PORT, () => {
         { command: 'item', description: 'Поиск: /item <название>' },
         { command: 'link', description: 'Привязать аккаунт сайта: /link КОД' },
         { command: 'unlink', description: 'Отвязать аккаунт сайта' },
-        { command: 'timers', description: 'Список моих таймеров' },
+        { command: 'timers', description: 'Мои таймеры (с кнопками управления)' },
         { command: 'timer_add', description: 'Добавить новый таймер' },
-        { command: 'timer_del', description: 'Удалить таймер: /timer_del ID' },
-        { command: 'timer_restart', description: 'Перезапустить таймер: /timer_restart ID' },
     ]).catch(err => console.error('Не удалось задать список команд:', err.message));
 });
 
@@ -336,13 +390,11 @@ bot.onText(/^\/start/, (msg) => {
     bot.sendMessage(msg.chat.id,
         'Привет! Я бот-справочник по игре МоБитва.\n\n' +
         '🔍 Поиск: просто напиши название предмета, руны, тотема и т.д.\n\n' +
-        '✈️ Чтобы управлять таймерами прямо из чата, сначала привяжи аккаунт сайта:\n' +
+        '✈️ Чтобы управлять таймерами прямо из чата (только в личных сообщениях), сначала привяжи аккаунт сайта:\n' +
         'зайди в личный кабинет на mobitva.help → раздел «Telegram-бот» → получи код → /link КОД\n\n' +
-        'После привязки доступно:\n' +
-        '/timers — список таймеров\n' +
-        '/timer_add — добавить таймер\n' +
-        '/timer_del ID — удалить\n' +
-        '/timer_restart ID — перезапустить\n\n' +
+        'После привязки:\n' +
+        '/timers — список таймеров с кнопками (перезапустить/удалить)\n' +
+        '/timer_add — добавить таймер (персонаж и время выбираются кнопками)\n\n' +
         `Сайт: ${SITE_URL}`
     ).catch(logSendErr);
 });
@@ -363,6 +415,7 @@ bot.onText(/^\/item(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
 });
 
 bot.onText(/^\/link(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
+    if (!requirePrivateChat(msg)) return;
     const code = match[1] ? match[1].trim().toUpperCase() : '';
     if (!code) {
         bot.sendMessage(msg.chat.id, 'Напиши код так: /link КОД (код показан в личном кабинете на сайте, в разделе «Telegram-бот»).').catch(logSendErr);
@@ -395,92 +448,138 @@ bot.onText(/^\/link(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
         bot.sendMessage(msg.chat.id, 'Не удалось привязать аккаунт. Попробуй ещё раз.').catch(logSendErr);
         return;
     }
-    bot.sendMessage(msg.chat.id, `✅ Готово! Telegram привязан к аккаунту «${data.login}». Теперь доступны /timers, /timer_add, /timer_del, /timer_restart.`).catch(logSendErr);
+    bot.sendMessage(msg.chat.id, `✅ Готово! Telegram привязан к аккаунту «${data.login}». Команда /timers покажет твои таймеры.`).catch(logSendErr);
 });
 
 bot.onText(/^\/unlink/, async (msg) => {
+    if (!requirePrivateChat(msg)) return;
     const { error } = await supabaseAdmin.from('telegram_links').delete().eq('telegram_chat_id', msg.chat.id);
     bot.sendMessage(msg.chat.id, error ? 'Не удалось отвязать.' : '🔌 Telegram отвязан от аккаунта на сайте.').catch(logSendErr);
 });
 
 bot.onText(/^\/timers/, async (msg) => {
+    if (!requirePrivateChat(msg)) return;
     const login = await requireLinkedLogin(msg.chat.id);
     if (!login) return;
+    const view = await buildTimersView(login);
+    bot.sendMessage(msg.chat.id, view.text, { reply_markup: view.keyboard || undefined }).catch(logSendErr);
+});
 
+async function startTimerAddFlow(chatId, login) {
     const characters = await getCharactersByLogin(login);
     if (characters.length === 0) {
-        bot.sendMessage(msg.chat.id, 'У тебя пока нет персонажей на сайте. Создай персонажа в личном кабинете.').catch(logSendErr);
+        bot.sendMessage(chatId, 'У тебя пока нет персонажей на сайте. Создай персонажа в личном кабинете.').catch(logSendErr);
         return;
     }
-
-    const lines = [];
-    for (const char of characters) {
-        const timers = await getTimersForCharacter(char.id);
-        lines.push(`👤 ${char.name}`);
-        if (timers.length === 0) {
-            lines.push('   (нет таймеров)');
-        } else {
-            for (const t of timers) {
-                const status = t.is_active ? formatRemaining(t.end_time) : 'на паузе';
-                lines.push(`   #${t.id} ⏱️ ${t.quest_name} — ${status}`);
-            }
-        }
+    if (characters.length === 1) {
+        timerAddState.set(chatId, { step: 'quest_name', login, characterId: characters[0].id, characterName: characters[0].name });
+        bot.sendMessage(chatId, `Персонаж: ${characters[0].name}\nНапиши название квеста/таймера:`, { reply_markup: { force_reply: true } }).catch(logSendErr);
+    } else {
+        timerAddState.set(chatId, { step: 'character', login, characters });
+        bot.sendMessage(chatId, 'Выбери персонажа:', { reply_markup: characterKeyboard(characters) }).catch(logSendErr);
     }
-    lines.push('', 'Команды: /timer_add, /timer_del ID, /timer_restart ID');
-    bot.sendMessage(msg.chat.id, lines.join('\n')).catch(logSendErr);
-});
+    setTimeout(() => timerAddState.delete(chatId), 5 * 60 * 1000);
+}
 
 bot.onText(/^\/timer_add/, async (msg) => {
+    if (!requirePrivateChat(msg)) return;
     const login = await requireLinkedLogin(msg.chat.id);
     if (!login) return;
-
-    const characters = await getCharactersByLogin(login);
-    if (characters.length === 0) {
-        bot.sendMessage(msg.chat.id, 'У тебя пока нет персонажей на сайте. Создай персонажа в личном кабинете.').catch(logSendErr);
-        return;
-    }
-
-    if (characters.length === 1) {
-        timerAddState.set(msg.chat.id, { step: 'quest_name', login, characterId: characters[0].id, characterName: characters[0].name });
-        bot.sendMessage(msg.chat.id, `Персонаж: ${characters[0].name}\nНапиши название квеста/таймера:`, { reply_markup: { force_reply: true } }).catch(logSendErr);
-    } else {
-        const list = characters.map((c, i) => `${i + 1}. ${c.name}`).join('\n');
-        timerAddState.set(msg.chat.id, { step: 'character', login, characters });
-        bot.sendMessage(msg.chat.id, `Выбери персонажа (напиши номер):\n${list}`, { reply_markup: { force_reply: true } }).catch(logSendErr);
-    }
-    setTimeout(() => timerAddState.delete(msg.chat.id), 5 * 60 * 1000);
+    await startTimerAddFlow(msg.chat.id, login);
 });
 
-bot.onText(/^\/timer_del(?:@\w+)?\s+(\d+)/, async (msg, match) => {
-    const login = await requireLinkedLogin(msg.chat.id);
-    if (!login) return;
+// ---- Обработка нажатий на инлайн-кнопки ----
+bot.on('callback_query', async (query) => {
+    const chatId = query.message.chat.id;
+    const data = query.data;
+    bot.answerCallbackQuery(query.id).catch(() => {});
 
-    const timerId = parseInt(match[1], 10);
-    const timer = await getTimerWithAuth(timerId, login);
-    if (!timer) {
-        bot.sendMessage(msg.chat.id, 'Таймер не найден или это не твой таймер.').catch(logSendErr);
+    if (query.message.chat.type !== 'private') {
+        bot.sendMessage(chatId, '🔒 Управление таймерами работает только в личных сообщениях боту.').catch(logSendErr);
         return;
     }
-    const { error } = await supabaseAdmin.from('user_timers').delete().eq('id', timerId);
-    bot.sendMessage(msg.chat.id, error ? '❌ Не удалось удалить.' : `🗑️ Таймер «${timer.quest_name}» удалён.`).catch(logSendErr);
-});
 
-bot.onText(/^\/timer_restart(?:@\w+)?\s+(\d+)/, async (msg, match) => {
-    const login = await requireLinkedLogin(msg.chat.id);
-    if (!login) return;
-
-    const timerId = parseInt(match[1], 10);
-    const timer = await getTimerWithAuth(timerId, login);
-    if (!timer) {
-        bot.sendMessage(msg.chat.id, 'Таймер не найден или это не твой таймер.').catch(logSendErr);
+    const login = await getLinkedLogin(chatId);
+    if (!login) {
+        bot.sendMessage(chatId, 'Сначала привяжи аккаунт: /link КОД').catch(logSendErr);
         return;
     }
-    const newEndTime = Date.now() + timer.duration;
-    const { error } = await supabaseAdmin
-        .from('user_timers')
-        .update({ end_time: newEndTime, is_active: true, notified_at: null })
-        .eq('id', timerId);
-    bot.sendMessage(msg.chat.id, error ? '❌ Не удалось перезапустить.' : `🔄 Таймер «${timer.quest_name}» перезапущен.`).catch(logSendErr);
+
+    // Выбор персонажа при добавлении таймера
+    if (data.startsWith('ac:')) {
+        const state = timerAddState.get(chatId);
+        if (!state || state.step !== 'character') return;
+        const idx = parseInt(data.slice(3), 10);
+        const chosen = state.characters[idx];
+        if (!chosen) return;
+        state.characterId = chosen.id;
+        state.characterName = chosen.name;
+        state.step = 'quest_name';
+        timerAddState.set(chatId, state);
+        bot.sendMessage(chatId, `Персонаж: ${chosen.name}\nНапиши название квеста/таймера:`, { reply_markup: { force_reply: true } }).catch(logSendErr);
+        return;
+    }
+
+    // Выбор длительности при добавлении таймера
+    if (data.startsWith('ad:')) {
+        const state = timerAddState.get(chatId);
+        if (!state || state.step !== 'duration') return;
+        const value = data.slice(3);
+        if (value === 'custom') {
+            state.step = 'duration_custom';
+            timerAddState.set(chatId, state);
+            bot.sendMessage(chatId, 'Напиши число минут:', { reply_markup: { force_reply: true } }).catch(logSendErr);
+            return;
+        }
+        await finishTimerAdd(chatId, state, parseInt(value, 10));
+        return;
+    }
+
+    // Начать добавление таймера кнопкой из списка
+    if (data === 'add') {
+        await startTimerAddFlow(chatId, login);
+        return;
+    }
+
+    // Вернуться к списку таймеров
+    if (data === 'tb') {
+        const view = await buildTimersView(login);
+        bot.sendMessage(chatId, view.text, { reply_markup: view.keyboard || undefined }).catch(logSendErr);
+        return;
+    }
+
+    // Открыть карточку конкретного таймера
+    if (data.startsWith('tl:')) {
+        const timerId = parseInt(data.slice(3), 10);
+        const timer = await getTimerWithAuth(timerId, login);
+        if (!timer) { bot.sendMessage(chatId, 'Таймер не найден.').catch(logSendErr); return; }
+        const status = timer.is_active ? formatRemaining(timer.end_time) : 'на паузе';
+        bot.sendMessage(chatId, `⏱️ ${timer.quest_name}\nОсталось: ${status}`, { reply_markup: timerDetailKeyboard(timerId) }).catch(logSendErr);
+        return;
+    }
+
+    // Удалить таймер
+    if (data.startsWith('td:')) {
+        const timerId = parseInt(data.slice(3), 10);
+        const timer = await getTimerWithAuth(timerId, login);
+        if (!timer) { bot.sendMessage(chatId, 'Таймер не найден.').catch(logSendErr); return; }
+        const { error } = await supabaseAdmin.from('user_timers').delete().eq('id', timerId);
+        bot.sendMessage(chatId, error ? '❌ Не удалось удалить.' : `🗑️ Таймер «${timer.quest_name}» удалён.`).catch(logSendErr);
+        return;
+    }
+
+    // Перезапустить таймер
+    if (data.startsWith('tr:')) {
+        const timerId = parseInt(data.slice(3), 10);
+        const timer = await getTimerWithAuth(timerId, login);
+        if (!timer) { bot.sendMessage(chatId, 'Таймер не найден.').catch(logSendErr); return; }
+        const newEndTime = Date.now() + timer.duration;
+        const { error } = await supabaseAdmin
+            .from('user_timers')
+            .update({ end_time: newEndTime, is_active: true, notified_at: null })
+            .eq('id', timerId);
+        bot.sendMessage(chatId, error ? '❌ Не удалось перезапустить.' : `🔄 Таймер «${timer.quest_name}» перезапущен.`).catch(logSendErr);
+    }
 });
 
 // Любое обычное сообщение без команды — либо шаг мастера /timer_add,
