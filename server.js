@@ -19,6 +19,13 @@ const { createClient } = require('@supabase/supabase-js');
 const WebSocket = require('ws');
 const Fuse = require('fuse.js');
 
+let sharp = null;
+try {
+    sharp = require('sharp');
+} catch (e) {
+    console.warn('! Модуль "sharp" недоступен — иконки в ответах поиска показываться не будут.');
+}
+
 // ---- Настройки (переменные окружения на хостинге) ----
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const PUBLIC_URL = process.env.PUBLIC_URL;
@@ -99,26 +106,84 @@ async function rebuildIndex() {
 rebuildIndex().catch(e => console.error('Не удалось построить индекс при старте:', e.message));
 setInterval(() => rebuildIndex().catch(e => console.error('Не удалось обновить индекс:', e.message)), REFRESH_INTERVAL_MS);
 
+// ---- Иконки предметов: вырезаем нужный кусок из общего спрайта сайта ----
+const SPRITE_URL = `${SITE_URL}/img/shopico.png`;
+const SPRITE_CELL = 180;
+let spriteBufferCache = null;
+
+async function getSpriteBuffer() {
+    if (spriteBufferCache) return spriteBufferCache;
+    try {
+        const res = await fetch(SPRITE_URL);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        spriteBufferCache = Buffer.from(await res.arrayBuffer());
+        return spriteBufferCache;
+    } catch (e) {
+        console.warn('! Не удалось загрузить спрайт иконок:', e.message);
+        return null;
+    }
+}
+
+async function getEntryIconBuffer(row) {
+    if (!sharp) return null;
+    if (row.icon_row === undefined || row.icon_row === null || row.icon_col === undefined || row.icon_col === null) return null;
+    const sprite = await getSpriteBuffer();
+    if (!sprite) return null;
+    try {
+        return await sharp(sprite)
+            .extract({
+                left: Number(row.icon_col) * SPRITE_CELL,
+                top: Number(row.icon_row) * SPRITE_CELL,
+                width: SPRITE_CELL,
+                height: SPRITE_CELL,
+            })
+            .png()
+            .toBuffer();
+    } catch (e) {
+        console.warn('! Не удалось вырезать иконку:', e.message);
+        return null;
+    }
+}
+
 function formatEntry(row) {
     const cat = row.__cat;
-    const lines = [];
-    lines.push(`${cat.label}: ${row.name || `#${row.id}`}`);
-    if (row.level !== undefined && row.level !== null) lines.push(`⭐ Уровень: ${row.level}`);
+    const blocks = [];
+    blocks.push(`${cat.label}: ${row.name || `#${row.id}`}`);
+    if (row.level !== undefined && row.level !== null) blocks.push(`⭐ Уровень: ${row.level}`);
+
     if (row.stats && typeof row.stats === 'object') {
-        const statsText = Object.entries(row.stats)
+        const statLines = Object.entries(row.stats)
             .filter(([, v]) => v !== null && v !== undefined && v !== '' && v !== 0)
-            .map(([k, v]) => `${k}: ${v}`)
-            .join(', ');
-        if (statsText) lines.push(statsText);
+            .map(([k, v]) => `• ${k}: ${v}`);
+        if (statLines.length) blocks.push(statLines.join('\n'));
     }
+
+    if (Array.isArray(row.unique_stats) && row.unique_stats.length > 0) {
+        blocks.push('✨ Уникальные характеристики:\n' + row.unique_stats.map(u => `• ${u}`).join('\n'));
+    }
+
     if (row.description) {
         let desc = String(row.description);
         if (desc.length > 200) desc = desc.slice(0, 197) + '...';
-        lines.push(desc);
+        blocks.push(desc);
     }
+
     const linkId = cat.param === 'set' ? (row.set_id ?? row.id) : row.id;
-    lines.push(`🔗 ${SITE_URL}${cat.appPath}?${cat.param}=${linkId}&open=modal`);
-    return lines.join('\n');
+    blocks.push(`🔗 ${SITE_URL}${cat.appPath}?${cat.param}=${linkId}&open=modal`);
+
+    let text = blocks.join('\n\n');
+    if (text.length > 1000) text = text.slice(0, 997) + '...';
+    return text;
+}
+
+async function sendEntryResult(chatId, row) {
+    const caption = formatEntry(row);
+    const iconBuffer = await getEntryIconBuffer(row);
+    if (iconBuffer) {
+        await bot.sendPhoto(chatId, iconBuffer, { caption }).catch(logSendErr);
+    } else {
+        await bot.sendMessage(chatId, caption, { disable_web_page_preview: true }).catch(logSendErr);
+    }
 }
 
 function fuzzySearch(query) {
@@ -137,8 +202,7 @@ async function handleSearch(chatId, query) {
         const exactMatches = allEntries.filter(e => e.name && e.name.trim().toLowerCase() === normalizedQuery);
 
         if (exactMatches.length > 0) {
-            const text = exactMatches.map(formatEntry).join('\n\n———\n\n');
-            bot.sendMessage(chatId, text, { disable_web_page_preview: true }).catch(logSendErr);
+            for (const row of exactMatches) await sendEntryResult(chatId, row);
             return;
         }
 
@@ -147,9 +211,8 @@ async function handleSearch(chatId, query) {
             bot.sendMessage(chatId, `Такого нет: «${query}». Похожего тоже ничего не нашёл — попробуй сформулировать иначе.`).catch(logSendErr);
             return;
         }
-        const text = `Точного совпадения с «${query}» нет, но вот похожее:\n\n` +
-            results.map(formatEntry).join('\n\n———\n\n');
-        bot.sendMessage(chatId, text, { disable_web_page_preview: true }).catch(logSendErr);
+        await bot.sendMessage(chatId, `Точного совпадения с «${query}» нет, но вот похожее:`).catch(logSendErr);
+        for (const row of results) await sendEntryResult(chatId, row);
     } catch (e) {
         console.error('Ошибка обработки запроса:', e);
         bot.sendMessage(chatId, 'Что-то пошло не так при поиске. Попробуй ещё раз чуть позже.').catch(logSendErr);
@@ -246,7 +309,10 @@ function escapeHtml(text) {
 async function buildCharactersView(login) {
     const characters = await getCharactersByLogin(login);
     if (characters.length === 0) {
-        return { text: 'У тебя пока нет персонажей на сайте. Создай персонажа в личном кабинете.', keyboard: null };
+        return {
+            text: 'У тебя пока нет персонажей. Создай первого:',
+            keyboard: { inline_keyboard: [[{ text: '➕ Создать персонажа', callback_data: 'cn' }]] },
+        };
     }
 
     const buttons = [];
@@ -258,7 +324,10 @@ async function buildCharactersView(login) {
             : `⚪ ${char.name} (нет таймеров)`;
         buttons.push([{ text: label, callback_data: `tc:${char.id}` }]);
     }
-    buttons.push([{ text: '➕ Добавить таймер', callback_data: 'add' }]);
+    buttons.push([
+        { text: '➕ Добавить таймер', callback_data: 'add' },
+        { text: '👤 Новый персонаж', callback_data: 'cn' },
+    ]);
 
     return {
         text: '👤 <b>Выбери персонажа:</b>\n\n🟢 много времени · 🟡 меньше часа · 🟠 скоро истечёт · 🔴 истёк · ⏸️ на паузе',
@@ -293,20 +362,60 @@ async function buildCharacterTimersView(login, characterId) {
     return { text, keyboard: { inline_keyboard: buttons } };
 }
 
-const DURATION_PRESETS = [120, 360, 720, 1440, 2880, 4320, 10080];
+// Готовые варианты длительности: минуты, часы, дни. В callback_data всегда
+// хранятся МИНУТЫ (число), подпись на кнопке — человекочитаемая.
+const DURATION_PRESETS = [
+    { label: '15 мин', minutes: 15 },
+    { label: '30 мин', minutes: 30 },
+    { label: '1 час', minutes: 60 },
+    { label: '3 часа', minutes: 180 },
+    { label: '6 часов', minutes: 360 },
+    { label: '12 часов', minutes: 720 },
+    { label: '1 день', minutes: 1440 },
+    { label: '2 дня', minutes: 2880 },
+    { label: '3 дня', minutes: 4320 },
+];
+
+// Разбирает ввод вида "90", "90м", "2ч", "1.5ч", "3д", "2h", "1d" в минуты.
+// Число без единицы считается минутами.
+function parseDurationToMinutes(text) {
+    const cleaned = text.trim().toLowerCase().replace(/\s+/g, '');
+    const match = cleaned.match(/^(\d+(?:[.,]\d+)?)(мин|м|min|m|часа|часов|час|ч|h|дней|дня|день|д|d)?$/);
+    if (!match) return null;
+    const value = parseFloat(match[1].replace(',', '.'));
+    const unit = match[2] || 'м';
+    let minutes;
+    if (['часа', 'часов', 'час', 'ч', 'h'].includes(unit)) minutes = value * 60;
+    else if (['дней', 'дня', 'день', 'д', 'd'].includes(unit)) minutes = value * 60 * 24;
+    else minutes = value;
+    minutes = Math.round(minutes);
+    return minutes > 0 ? minutes : null;
+}
+
+// Красиво пишет длительность: "90 мин" -> "1 ч 30 мин", "1500" -> "1 д 1 ч"
+function formatDurationMinutes(totalMin) {
+    const d = Math.floor(totalMin / 1440);
+    const h = Math.floor((totalMin % 1440) / 60);
+    const m = totalMin % 60;
+    const parts = [];
+    if (d) parts.push(`${d} д`);
+    if (h) parts.push(`${h} ч`);
+    if (m || parts.length === 0) parts.push(`${m} мин`);
+    return parts.join(' ');
+}
 
 function characterKeyboard(characters) {
-    return {
-        inline_keyboard: characters.map((c, i) => [{ text: c.name, callback_data: `ac:${i}` }]),
-    };
+    const rows = characters.map((c, i) => [{ text: c.name, callback_data: `ac:${i}` }]);
+    rows.push([{ text: '👤 Новый персонаж', callback_data: 'cnt' }]);
+    return { inline_keyboard: rows };
 }
 
 function durationKeyboard() {
     const rows = [];
     for (let i = 0; i < DURATION_PRESETS.length; i += 3) {
-        rows.push(DURATION_PRESETS.slice(i, i + 3).map(m => ({ text: `${m} мин`, callback_data: `ad:${m}` })));
+        rows.push(DURATION_PRESETS.slice(i, i + 3).map(p => ({ text: p.label, callback_data: `ad:${p.minutes}` })));
     }
-    rows.push([{ text: '✏️ Другое количество минут', callback_data: 'ad:custom' }]);
+    rows.push([{ text: '✏️ Своё время (минуты / часы / дни)', callback_data: 'ad:custom' }]);
     return { inline_keyboard: rows };
 }
 
@@ -335,9 +444,11 @@ async function handleTimerAddStep(msg) {
     }
 
     if (state.step === 'duration_custom') {
-        const minutes = parseInt(text.replace(/[^\d]/g, ''), 10);
-        if (!minutes || minutes <= 0) {
-            bot.sendMessage(msg.chat.id, 'Не понял число минут, напиши ещё раз просто цифрой, например: 90').catch(logSendErr);
+        const minutes = parseDurationToMinutes(text);
+        if (!minutes) {
+            bot.sendMessage(msg.chat.id,
+                'Не понял время. Примеры: 90 (минуты), 45м, 2ч, 1.5ч, 3д — попробуй ещё раз.'
+            ).catch(logSendErr);
             return;
         }
         await finishTimerAdd(msg.chat.id, state, minutes);
@@ -366,7 +477,7 @@ async function finishTimerAdd(chatId, state, minutes) {
         bot.sendMessage(chatId, '❌ Не удалось создать таймер.').catch(logSendErr);
         return;
     }
-    bot.sendMessage(chatId, `✅ Таймер «${state.questName}» на ${minutes} мин добавлен персонажу ${state.characterName}.`).catch(logSendErr);
+    bot.sendMessage(chatId, `✅ Таймер «${state.questName}» на ${formatDurationMinutes(minutes)} добавлен персонажу ${state.characterName}.`).catch(logSendErr);
 }
 
 // ==================== ФОНОВАЯ ПРОВЕРКА ИСТЁКШИХ ТАЙМЕРОВ ====================
@@ -425,6 +536,7 @@ app.listen(PORT, () => {
         { command: 'unlink', description: 'Отвязать аккаунт сайта' },
         { command: 'timers', description: 'Мои таймеры (с кнопками управления)' },
         { command: 'timer_add', description: 'Добавить новый таймер' },
+        { command: 'char_add', description: 'Создать нового персонажа' },
     ]).catch(err => console.error('Не удалось задать список команд:', err.message));
 });
 
@@ -437,8 +549,9 @@ bot.onText(/^\/start/, (msg) => {
         '✈️ Чтобы управлять таймерами прямо из чата (только в личных сообщениях), сначала привяжи аккаунт сайта:\n' +
         'зайди в личный кабинет на mobitva.help → раздел «Telegram-бот» → получи код → /link КОД\n\n' +
         'После привязки:\n' +
-        '/timers — список таймеров с кнопками (перезапустить/удалить)\n' +
-        '/timer_add — добавить таймер (персонаж и время выбираются кнопками)\n\n' +
+        '/timers — персонажи и их таймеры с кнопками (перезапустить/удалить)\n' +
+        '/timer_add — добавить таймер (время: минуты, часы или дни)\n' +
+        '/char_add — создать нового персонажа\n\n' +
         `Сайт: ${SITE_URL}`
     ).catch(logSendErr);
 });
@@ -512,7 +625,9 @@ bot.onText(/^\/timers/, async (msg) => {
 async function startTimerAddFlow(chatId, login) {
     const characters = await getCharactersByLogin(login);
     if (characters.length === 0) {
-        bot.sendMessage(chatId, 'У тебя пока нет персонажей на сайте. Создай персонажа в личном кабинете.').catch(logSendErr);
+        bot.sendMessage(chatId, 'У тебя пока нет персонажей. Сначала создай первого:', {
+            reply_markup: { inline_keyboard: [[{ text: '➕ Создать персонажа', callback_data: 'cnt' }]] },
+        }).catch(logSendErr);
         return;
     }
     if (characters.length === 1) {
@@ -524,6 +639,53 @@ async function startTimerAddFlow(chatId, login) {
     }
     setTimeout(() => timerAddState.delete(chatId), 5 * 60 * 1000);
 }
+
+// ---- Создание персонажа ----
+const charAddState = new Map(); // chatId -> { login, thenTimerAdd }
+
+async function createCharacter(chatId, login, name, thenTimerAdd) {
+    const cleanName = name.trim().slice(0, 40);
+    if (!cleanName) {
+        bot.sendMessage(chatId, 'Имя не может быть пустым. Напиши имя персонажа ещё раз:', { reply_markup: { force_reply: true } }).catch(logSendErr);
+        return false;
+    }
+    const characters = await getCharactersByLogin(login);
+    if (characters.some(c => c.name.trim().toLowerCase() === cleanName.toLowerCase())) {
+        bot.sendMessage(chatId, `Персонаж «${cleanName}» у тебя уже есть. Напиши другое имя:`, { reply_markup: { force_reply: true } }).catch(logSendErr);
+        return false;
+    }
+    const maxOrder = characters.reduce((max, c) => Math.max(max, c.order_index || 0), 0);
+    const { error } = await supabaseAdmin
+        .from('user_characters')
+        .insert([{ user_id: login, name: cleanName, order_index: maxOrder + 1 }]);
+    charAddState.delete(chatId);
+    if (error) {
+        console.error('Ошибка создания персонажа:', error.message);
+        bot.sendMessage(chatId, '❌ Не удалось создать персонажа.').catch(logSendErr);
+        return true;
+    }
+    bot.sendMessage(chatId, `✅ Персонаж «${cleanName}» создан!`).catch(logSendErr);
+    if (thenTimerAdd) await startTimerAddFlow(chatId, login);
+    return true;
+}
+
+function askCharacterName(chatId, login, thenTimerAdd) {
+    charAddState.set(chatId, { login, thenTimerAdd: !!thenTimerAdd });
+    setTimeout(() => charAddState.delete(chatId), 5 * 60 * 1000);
+    bot.sendMessage(chatId, 'Напиши имя нового персонажа:', { reply_markup: { force_reply: true } }).catch(logSendErr);
+}
+
+bot.onText(/^\/char_add(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
+    if (!requirePrivateChat(msg)) return;
+    const login = await requireLinkedLogin(msg.chat.id);
+    if (!login) return;
+    const name = match[1] ? match[1].trim() : '';
+    if (!name) {
+        askCharacterName(msg.chat.id, login, false);
+        return;
+    }
+    await createCharacter(msg.chat.id, login, name, false);
+});
 
 bot.onText(/^\/timer_add/, async (msg) => {
     if (!requirePrivateChat(msg)) return;
@@ -572,10 +734,17 @@ bot.on('callback_query', async (query) => {
         if (value === 'custom') {
             state.step = 'duration_custom';
             timerAddState.set(chatId, state);
-            bot.sendMessage(chatId, 'Напиши число минут:', { reply_markup: { force_reply: true } }).catch(logSendErr);
+            bot.sendMessage(chatId, 'Напиши время: просто число = минуты, либо с буквой — например 90, 45м, 2ч, 1.5ч, 3д:', { reply_markup: { force_reply: true } }).catch(logSendErr);
             return;
         }
         await finishTimerAdd(chatId, state, parseInt(value, 10));
+        return;
+    }
+
+    // Создать нового персонажа (просто создать / создать и сразу добавить таймер)
+    if (data === 'cn' || data === 'cnt') {
+        timerAddState.delete(chatId);
+        askCharacterName(chatId, login, data === 'cnt');
         return;
     }
 
@@ -653,6 +822,12 @@ bot.on('message', async (msg) => {
     if (!msg.text) return;
     if (msg.text.startsWith('/')) return;
     if (msg.chat.type !== 'private') return;
+
+    if (charAddState.has(msg.chat.id)) {
+        const state = charAddState.get(msg.chat.id);
+        await createCharacter(msg.chat.id, state.login, msg.text.trim(), state.thenTimerAdd);
+        return;
+    }
 
     if (timerAddState.has(msg.chat.id)) {
         await handleTimerAddStep(msg);
