@@ -537,10 +537,103 @@ app.listen(PORT, () => {
         { command: 'timers', description: 'Мои таймеры (с кнопками управления)' },
         { command: 'timer_add', description: 'Добавить новый таймер' },
         { command: 'char_add', description: 'Создать нового персонажа' },
+        { command: 'watch_game', description: 'Следить, не упала ли игра (mmobitva.ru/.net)' },
+        { command: 'unwatch_game', description: 'Выключить уведомления о доступности игры' },
     ]).catch(err => console.error('Не удалось задать список команд:', err.message));
 });
 
 // ==================== КОМАНДЫ ====================
+
+// ==================== СЛЕЖЕНИЕ ЗА ДОСТУПНОСТЬЮ ИГРОВЫХ ДОМЕНОВ ====================
+// Бот не может знать настоящую причину сбоя (упал хостинг, идут работы,
+// DDoS и т.п.) — только технический симптом (не отвечает / ошибка сервера /
+// не резолвится DNS). Честно сообщаем именно это, без выдумок.
+
+const GAME_DOMAINS = [
+    { name: 'mmobitva.ru', url: 'https://mmobitva.ru/' },
+    { name: 'mobitva.net', url: 'https://mobitva.net/' },
+];
+const CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const FAIL_THRESHOLD = 2; // столько неудачных проверок подряд, прежде чем объявить "не работает"
+
+const domainState = new Map(); // name -> { up: true|false|null, failCount: number }
+
+async function getWatchChats() {
+    const { data, error } = await supabaseAdmin.from('watch_chats').select('chat_id');
+    if (error) { console.error('getWatchChats:', error.message); return []; }
+    return (data || []).map(r => r.chat_id);
+}
+
+async function notifyWatchers(text) {
+    const chats = await getWatchChats();
+    for (const chatId of chats) {
+        bot.sendMessage(chatId, text).catch(logSendErr);
+    }
+}
+
+async function checkDomain(domain) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+        const res = await fetch(domain.url, { signal: controller.signal, redirect: 'follow' });
+        clearTimeout(timeout);
+        if (res.status >= 500) return { up: false, reason: `сервер вернул ошибку ${res.status}` };
+        return { up: true };
+    } catch (e) {
+        clearTimeout(timeout);
+        if (e.name === 'AbortError') return { up: false, reason: 'не отвечает (таймаут)' };
+        const code = e.cause && e.cause.code;
+        if (code === 'ENOTFOUND') return { up: false, reason: 'не резолвится домен (проблема с DNS)' };
+        if (code === 'ECONNREFUSED') return { up: false, reason: 'сервер отказывается принимать соединения' };
+        return { up: false, reason: 'недоступен (ошибка соединения)' };
+    }
+}
+
+const QUICK_RECHECK_MS = 30 * 1000; // подтверждающая проверка — быстро, не ждём весь цикл
+
+async function checkSingleDomain(domain) {
+    const result = await checkDomain(domain);
+    let state = domainState.get(domain.name) || { up: null, failCount: 0 };
+
+    if (result.up) {
+        const wasDown = state.up === false;
+        domainState.set(domain.name, { up: true, failCount: 0 });
+        if (wasDown) await notifyWatchers(`✅ ${domain.name} снова работает!`);
+        return;
+    }
+
+    state.failCount++;
+    if (state.up !== false && state.failCount >= FAIL_THRESHOLD) {
+        domainState.set(domain.name, { up: false, failCount: state.failCount });
+        await notifyWatchers(`🔴 ${domain.name} не отвечает — ${result.reason}. Похоже, игра временно недоступна.`);
+    } else {
+        domainState.set(domain.name, state);
+        // не нашли проблему окончательно — перепроверим быстро, не через 5 минут
+        setTimeout(() => checkSingleDomain(domain).catch(e => console.error('Ошибка проверки домена:', e.message)), QUICK_RECHECK_MS);
+    }
+}
+
+async function checkGameDomainsAndNotify() {
+    for (const domain of GAME_DOMAINS) {
+        await checkSingleDomain(domain);
+    }
+}
+
+setTimeout(() => checkGameDomainsAndNotify().catch(e => console.error('Ошибка проверки доменов:', e.message)), 20000);
+setInterval(() => checkGameDomainsAndNotify().catch(e => console.error('Ошибка проверки доменов:', e.message)), CHECK_INTERVAL_MS);
+
+bot.onText(/^\/watch_game/, async (msg) => {
+    const { error } = await supabaseAdmin.from('watch_chats').upsert([{ chat_id: msg.chat.id }], { onConflict: 'chat_id' });
+    bot.sendMessage(msg.chat.id, error
+        ? '❌ Не удалось включить уведомления.'
+        : `✅ Буду писать сюда, если ${GAME_DOMAINS.map(d => d.name).join(' или ')} перестанут отвечать (и когда снова заработают).`
+    ).catch(logSendErr);
+});
+
+bot.onText(/^\/unwatch_game/, async (msg) => {
+    const { error } = await supabaseAdmin.from('watch_chats').delete().eq('chat_id', msg.chat.id);
+    bot.sendMessage(msg.chat.id, error ? '❌ Не удалось отключить.' : '🔕 Уведомления о доступности игры здесь отключены.').catch(logSendErr);
+});
 
 bot.onText(/^\/start/, (msg) => {
     bot.sendMessage(msg.chat.id,
@@ -818,6 +911,46 @@ bot.on('callback_query', async (query) => {
 
 // Любое обычное сообщение без команды — либо шаг мастера /timer_add,
 // либо поиск (только в личных чатах с ботом).
+// ==================== "НЫТИК ДНЯ" ====================
+// Telegram не даёт боту список всех участников группы — зато бот видит
+// каждое сообщение, поэтому сам запоминает, кто писал в чат, и раз в сутки
+// выбирает случайного из уже замеченных.
+
+const groupMembers = new Map();       // chatId -> Map(userId -> имя)
+const lastWhinerPostDate = new Map(); // chatId -> 'YYYY-MM-DD'
+
+function trackGroupMember(msg) {
+    if (msg.chat.type !== 'group' && msg.chat.type !== 'supergroup') return;
+    if (!msg.from || msg.from.is_bot) return;
+    if (!groupMembers.has(msg.chat.id)) groupMembers.set(msg.chat.id, new Map());
+    const name = msg.from.first_name + (msg.from.last_name ? ' ' + msg.from.last_name : '');
+    groupMembers.get(msg.chat.id).set(msg.from.id, name);
+}
+
+bot.on('message', (msg) => trackGroupMember(msg));
+
+function todayKey() {
+    return new Date().toISOString().slice(0, 10); // YYYY-MM-DD по UTC
+}
+
+async function checkDailyWhiner() {
+    const today = todayKey();
+    for (const [chatId, members] of groupMembers.entries()) {
+        if (lastWhinerPostDate.get(chatId) === today) continue;
+        if (members.size === 0) continue;
+        const ids = Array.from(members.keys());
+        const pickId = ids[Math.floor(Math.random() * ids.length)];
+        const name = members.get(pickId);
+        lastWhinerPostDate.set(chatId, today);
+        const mention = `<a href="tg://user?id=${pickId}">${escapeHtml(name)}</a>`;
+        bot.sendMessage(chatId, `😤 Нытик дня: ${mention}! Поздравляем, держи корону 👑`, { parse_mode: 'HTML' }).catch(logSendErr);
+    }
+}
+
+// Проверяем раз в час, не наступил ли новый день — не нужен отдельный
+// внешний cron, хватает уже настроенного автопинга, который не даёт боту уснуть.
+setInterval(() => checkDailyWhiner().catch(e => console.error('Ошибка "нытика дня":', e.message)), 60 * 60 * 1000);
+
 bot.on('message', async (msg) => {
     if (!msg.text) return;
     if (msg.text.startsWith('/')) return;

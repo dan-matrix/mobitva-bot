@@ -9,8 +9,7 @@ Telegram-бот для Mobitva.help:
 
 ## Шаг 1. Выполнить SQL в Supabase
 1. Зайди в свой проект на [supabase.com](https://supabase.com) → **SQL Editor** → **New query**.
-2. Открой файл `sql/001_telegram_links.sql` из этой папки, скопируй его содержимое и вставь в редактор.
-3. Нажми **Run**. Должно пройти без ошибок — создастся таблица `telegram_links` и новая колонка `notified_at` в `user_timers`.
+2. По очереди выполни оба файла из папки `sql/`: сначала `001_telegram_links.sql`, затем `002_watch_chats.sql` — скопируй содержимое каждого, вставь, нажми **Run**. Если уже выполнял `001` раньше — не трогай его заново, нужен только новый `002`.
 
 ## Шаг 2. Взять привилегированный ключ (service role)
 1. В Supabase зайди в **Project Settings → API**.
