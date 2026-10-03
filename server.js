@@ -539,6 +539,7 @@ app.listen(PORT, () => {
         { command: 'char_add', description: 'Создать нового персонажа' },
         { command: 'watch_game', description: 'Следить, не упала ли игра (mmobitva.ru/.net)' },
         { command: 'unwatch_game', description: 'Выключить уведомления о доступности игры' },
+        { command: 'nytik', description: 'Нытик дня (в группе)' },
     ]).catch(err => console.error('Не удалось задать список команд:', err.message));
 });
 
@@ -916,12 +917,17 @@ bot.on('callback_query', async (query) => {
 // каждое сообщение, поэтому сам запоминает, кто писал в чат, и раз в сутки
 // выбирает случайного из уже замеченных.
 
-const groupMembers = new Map();       // chatId -> Map(userId -> имя)
-const lastWhinerPostDate = new Map(); // chatId -> 'YYYY-MM-DD'
+const groupMembers = new Map(); // chatId -> Map(userId -> имя)
+
+// Эти люди никогда не становятся "нытиком дня" — просто исключаем их
+// из списка кандидатов на этапе отслеживания сообщений.
+const WHINER_EXCLUDED_USERNAMES = ['laa_dan', 'e_v_g_e_x_a'];
 
 function trackGroupMember(msg) {
     if (msg.chat.type !== 'group' && msg.chat.type !== 'supergroup') return;
     if (!msg.from || msg.from.is_bot) return;
+    const username = (msg.from.username || '').toLowerCase();
+    if (WHINER_EXCLUDED_USERNAMES.includes(username)) return;
     if (!groupMembers.has(msg.chat.id)) groupMembers.set(msg.chat.id, new Map());
     const name = msg.from.first_name + (msg.from.last_name ? ' ' + msg.from.last_name : '');
     groupMembers.get(msg.chat.id).set(msg.from.id, name);
@@ -933,23 +939,68 @@ function todayKey() {
     return new Date().toISOString().slice(0, 10); // YYYY-MM-DD по UTC
 }
 
+// Читает из базы, кто уже объявлен нытиком дня в этом чате (если есть на сегодня)
+async function getTodaysWhiner(chatId) {
+    const { data, error } = await supabaseAdmin
+        .from('daily_whiner')
+        .select('*')
+        .eq('chat_id', chatId)
+        .maybeSingle();
+    if (error) { console.error('getTodaysWhiner:', error.message); return null; }
+    if (!data || data.date !== todayKey()) return null;
+    return data;
+}
+
+// Выбирает нового нытика дня и сохраняет в базу (переживает перезапуски бота)
+async function pickAndSaveWhiner(chatId) {
+    const members = groupMembers.get(chatId);
+    if (!members || members.size === 0) return null;
+    const ids = Array.from(members.keys());
+    const pickId = ids[Math.floor(Math.random() * ids.length)];
+    const name = members.get(pickId);
+    const record = { chat_id: chatId, date: todayKey(), user_id: pickId, user_name: name };
+    const { error } = await supabaseAdmin.from('daily_whiner').upsert([record], { onConflict: 'chat_id' });
+    if (error) { console.error('pickAndSaveWhiner:', error.message); return null; }
+    return record;
+}
+
+function whinerMention(record) {
+    return `<a href="tg://user?id=${record.user_id}">${escapeHtml(record.user_name)}</a>`;
+}
+
+// Фоновая проверка — раз в час смотрим по каждому известному чату,
+// объявлен ли уже сегодняшний нытик; если нет, выбираем и объявляем.
 async function checkDailyWhiner() {
-    const today = todayKey();
-    for (const [chatId, members] of groupMembers.entries()) {
-        if (lastWhinerPostDate.get(chatId) === today) continue;
-        if (members.size === 0) continue;
-        const ids = Array.from(members.keys());
-        const pickId = ids[Math.floor(Math.random() * ids.length)];
-        const name = members.get(pickId);
-        lastWhinerPostDate.set(chatId, today);
-        const mention = `<a href="tg://user?id=${pickId}">${escapeHtml(name)}</a>`;
-        bot.sendMessage(chatId, `😤 Нытик дня: ${mention}! Поздравляем, держи корону 👑`, { parse_mode: 'HTML' }).catch(logSendErr);
+    for (const chatId of groupMembers.keys()) {
+        const existing = await getTodaysWhiner(chatId);
+        if (existing) continue;
+        const record = await pickAndSaveWhiner(chatId);
+        if (!record) continue;
+        bot.sendMessage(chatId, `😤 Нытик дня: ${whinerMention(record)}! Поздравляем, держи корону 👑`, { parse_mode: 'HTML' }).catch(logSendErr);
     }
 }
 
-// Проверяем раз в час, не наступил ли новый день — не нужен отдельный
-// внешний cron, хватает уже настроенного автопинга, который не даёт боту уснуть.
 setInterval(() => checkDailyWhiner().catch(e => console.error('Ошибка "нытика дня":', e.message)), 60 * 60 * 1000);
+
+// Команда для ручного запроса в группе: если нытик дня ещё не объявлен — объявляет
+// прямо сейчас; если уже объявлен — просто напоминает, кто сегодня победил.
+bot.onText(/^\/nytik/, async (msg) => {
+    if (msg.chat.type !== 'group' && msg.chat.type !== 'supergroup') {
+        bot.sendMessage(msg.chat.id, 'Эта команда работает только в групповом чате.').catch(logSendErr);
+        return;
+    }
+    const existing = await getTodaysWhiner(msg.chat.id);
+    if (existing) {
+        bot.sendMessage(msg.chat.id, `Нытик дня уже объявлен: ${whinerMention(existing)} 👑 (следующий — завтра)`, { parse_mode: 'HTML' }).catch(logSendErr);
+        return;
+    }
+    const record = await pickAndSaveWhiner(msg.chat.id);
+    if (!record) {
+        bot.sendMessage(msg.chat.id, 'Пока не видел здесь никого, кроме исключённых — не из кого выбирать 🤷').catch(logSendErr);
+        return;
+    }
+    bot.sendMessage(msg.chat.id, `😤 Нытик дня: ${whinerMention(record)}! Поздравляем, держи корону 👑`, { parse_mode: 'HTML' }).catch(logSendErr);
+});
 
 // ==================== ПАСХАЛКИ И ПОДКОЛЫ ====================
 
