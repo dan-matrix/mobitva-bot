@@ -996,7 +996,7 @@ bot.onText(/^\/nytik/, async (msg) => {
     }
     const record = await pickAndSaveWhiner(msg.chat.id);
     if (!record) {
-        bot.sendMessage(msg.chat.id, 'Пока не видел здесь никого, кроме исключённых — не из кого выбирать 🤷').catch(logSendErr);
+        bot.sendMessage(msg.chat.id, 'Пока не видел здесь никого, не из кого выбирать 🤷').catch(logSendErr);
         return;
     }
     bot.sendMessage(msg.chat.id, `😤 Нытик дня: ${whinerMention(record)}! Поздравляем, держи корону 👑`, { parse_mode: 'HTML' }).catch(logSendErr);
