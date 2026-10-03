@@ -951,6 +951,80 @@ async function checkDailyWhiner() {
 // внешний cron, хватает уже настроенного автопинга, который не даёт боту уснуть.
 setInterval(() => checkDailyWhiner().catch(e => console.error('Ошибка "нытика дня":', e.message)), 60 * 60 * 1000);
 
+// ==================== ПАСХАЛКИ И ПОДКОЛЫ ====================
+
+const EASTER_EGGS = [
+    {
+        pattern: /^как\s*дела\??$/i,
+        responses: [
+            'Дела как у твоих таймеров — то и дело что-то горит, но я держусь.',
+            'Нормально, бока намяло от твоих запросов, но живой.',
+            'Дела — отвечаю на вопросы и смотрю, как вы опять забыли про таймер. Как обычно, короче.',
+        ],
+    },
+    {
+        pattern: /^(ты\s*жив[а-я]*|ты\s*тут|ты\s*онлайн|живой\??)\??$/i,
+        responses: [
+            'Жив, не ссы. В отличие от твоего последнего таймера, который сдох ещё час назад.',
+            'Тут я, тут. Кто бы ещё за тебя квесты помнил.',
+            'Живее всех живых, чего не скажешь про твою удачу в поиске секреток.',
+        ],
+    },
+    {
+        pattern: /расскажи\s*анекдот/i,
+        responses: [
+            'Прихожу к игроку домой, а у него все таймеры истекли ещё вчера. Вот это я понимаю, анекдот.',
+            'Купил мужик меч +32 урона, принёс домой — а там уже другой выбит. Как и твои планы на сегодня.',
+            'Не рассказываю анекдоты, я и так один сплошной анекдот — бот на бесплатном хостинге, который иногда засыпает.',
+        ],
+    },
+    {
+        pattern: /(спасибо|благодарю|спс|пасиб)/i,
+        responses: [
+            'Не за что, бро. Иди лучше таймер поставь, а не спасибовай.',
+            'Всегда пожалуйста. Любовь к боту можно выразить и так: не спамь мне в 4 утра.',
+            'Пожалуйста. Теперь иди и перестань терять свои секретки.',
+        ],
+    },
+    {
+        pattern: /^(ты\s*кто|кто\s*ты)\??$/i,
+        responses: [
+            'Я тот самый бот, который помнит про твои таймеры лучше, чем ты сам.',
+            'Скромный слуга клана МоБитва. Ищу предметы, слежу за таймерами и иногда подкалываю. Как сейчас.',
+        ],
+    },
+];
+
+function matchEasterEgg(text) {
+    const trimmed = text.trim();
+    for (const egg of EASTER_EGGS) {
+        if (egg.pattern.test(trimmed)) {
+            return egg.responses[Math.floor(Math.random() * egg.responses.length)];
+        }
+    }
+    return null;
+}
+
+const NIGHT_OWL_JABS = [
+    '🦉 Полночь на дворе, а ты всё ещё тут сидишь. Ладно, держи что просил:',
+    '🌙 {hour}:00, а тебе всё неймётся. Окей, отвечаю, но ложиться спать я тебе не запрещаю:',
+    '😴 Нормальные люди в это время спят, а ты боту пишешь. Уважаю фанатизм. Вот ответ:',
+    '🌃 Самое время для таймеров и бессонницы, да? Ладно, разбираемся:',
+];
+
+// Московское время (UTC+3) — поменяй смещение в TZ_OFFSET_HOURS, если клан в другом поясе
+const TZ_OFFSET_HOURS = 3;
+
+function maybeNightOwlJab(msgDateUnix) {
+    const utcHour = new Date(msgDateUnix * 1000).getUTCHours();
+    const localHour = (utcHour + TZ_OFFSET_HOURS) % 24;
+    if (localHour >= 0 && localHour < 5 && Math.random() < 0.5) {
+        const template = NIGHT_OWL_JABS[Math.floor(Math.random() * NIGHT_OWL_JABS.length)];
+        return template.replace('{hour}', localHour);
+    }
+    return null;
+}
+
 bot.on('message', async (msg) => {
     if (!msg.text) return;
     if (msg.text.startsWith('/')) return;
@@ -966,6 +1040,15 @@ bot.on('message', async (msg) => {
         await handleTimerAddStep(msg);
         return;
     }
+
+    const eggReply = matchEasterEgg(msg.text);
+    if (eggReply) {
+        bot.sendMessage(msg.chat.id, eggReply).catch(logSendErr);
+        return;
+    }
+
+    const jab = maybeNightOwlJab(msg.date);
+    if (jab) await bot.sendMessage(msg.chat.id, jab).catch(logSendErr);
 
     await handleSearch(msg.chat.id, msg.text.trim());
 });
