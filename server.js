@@ -968,6 +968,37 @@ function whinerMention(record) {
     return `<a href="tg://user?id=${record.user_id}">${escapeHtml(record.user_name)}</a>`;
 }
 
+const WHINER_ANNOUNCEMENTS = [
+    (m) => `😤 <b>НЫТИК ДНЯ</b> 👑\n\n${m} — сегодня твой день, подъебать некого, короновать некого, кроме тебя.\nНой дальше, но теперь с короной на бошке.`,
+    (m) => `🏆 Итоги дня подведены.\n\nПо многочисленным жалобам, стонам и нытью в чате сегодняшним нытиком единогласно избран ${m}.\nНоси корону с достоинством, бля.`,
+    (m) => `📢 ВНИМАНИЕ, ОБЪЯВЛЕНИЕ\n\n${m} — ты официально самый нытливый долбоёб этого дня.\nОстальные свободны, расходимся, тут всё ясно.`,
+    (m) => `😩 Рейтинг нытья за сегодня закрыт.\n\nПобедитель: ${m}\nПричина: хуй знает, но нытья было дохуя.\n👑 Корона твоя, заслужил.`,
+    (m) => `🎙️ Голос с небес: "Сегодня ты, ${m}, был особенно невыносим."\n\nПоздравляю с титулом Нытика Дня, страдалец ты наш.`,
+    (m) => `💩 Внимание, подъехали итоги:\n\n${m} сегодня ныл больше всех, и это не обсуждается.\nКорону на царские сопли — получай.`,
+    (m) => `🏅 Нытик дня — ${m}\n\nЗа выдающиеся заслуги в области нытья, жалоб и ноющего поведения чат награждает тебя этим почётным ебанистическим титулом.`,
+    (m) => `⚰️ Сегодня мы хороним твоё достоинство, ${m}.\nТы — нытик дня. Соболезнования приняты не будут.`,
+    (m) => `🔔 Экстренный выпуск новостей.\n\nГлавная тема дня: ${m} снова ноет больше остальных вместе взятых.\n👑 Корона, трон, всё как положено.`,
+    (m) => `🧻 ${m}, твоего нытья за сегодня хватило бы на рулон туалетной бумаги.\n\nПоздравляем, нытик дня — это ты.`,
+];
+
+function randomWhinerAnnouncement(record) {
+    const mention = whinerMention(record);
+    const template = WHINER_ANNOUNCEMENTS[Math.floor(Math.random() * WHINER_ANNOUNCEMENTS.length)];
+    return template(mention);
+}
+
+const WHINER_ALREADY_ANNOUNCED = [
+    (m) => `Опоздал. Нытик дня уже коронован — это ${m}. Приходи завтра, может, твоя очередь.`,
+    (m) => `Уже всё решено без тебя: нытик дня — ${m}. Следующий замер нытья завтра.`,
+    (m) => `Результат объявлен: ${m} 👑. Переголосования не будет, расходимся.`,
+];
+
+function randomWhinerAlready(record) {
+    const mention = whinerMention(record);
+    const template = WHINER_ALREADY_ANNOUNCED[Math.floor(Math.random() * WHINER_ALREADY_ANNOUNCED.length)];
+    return template(mention);
+}
+
 // Фоновая проверка — раз в час смотрим по каждому известному чату,
 // объявлен ли уже сегодняшний нытик; если нет, выбираем и объявляем.
 async function checkDailyWhiner() {
@@ -976,7 +1007,7 @@ async function checkDailyWhiner() {
         if (existing) continue;
         const record = await pickAndSaveWhiner(chatId);
         if (!record) continue;
-        bot.sendMessage(chatId, `😤 Нытик дня: ${whinerMention(record)}! Поздравляем, держи корону 👑`, { parse_mode: 'HTML' }).catch(logSendErr);
+        bot.sendMessage(chatId, randomWhinerAnnouncement(record), { parse_mode: 'HTML' }).catch(logSendErr);
     }
 }
 
@@ -991,15 +1022,15 @@ bot.onText(/^\/nytik/, async (msg) => {
     }
     const existing = await getTodaysWhiner(msg.chat.id);
     if (existing) {
-        bot.sendMessage(msg.chat.id, `Нытик дня уже объявлен: ${whinerMention(existing)} 👑 (следующий — завтра)`, { parse_mode: 'HTML' }).catch(logSendErr);
+        bot.sendMessage(msg.chat.id, randomWhinerAlready(existing), { parse_mode: 'HTML' }).catch(logSendErr);
         return;
     }
     const record = await pickAndSaveWhiner(msg.chat.id);
     if (!record) {
-        bot.sendMessage(msg.chat.id, 'Пока не видел здесь никого, не из кого выбирать 🤷').catch(logSendErr);
+        bot.sendMessage(msg.chat.id, 'Пока не видел здесь никого, кроме исключённых — не из кого выбирать 🤷').catch(logSendErr);
         return;
     }
-    bot.sendMessage(msg.chat.id, `😤 Нытик дня: ${whinerMention(record)}! Поздравляем, держи корону 👑`, { parse_mode: 'HTML' }).catch(logSendErr);
+    bot.sendMessage(msg.chat.id, randomWhinerAnnouncement(record), { parse_mode: 'HTML' }).catch(logSendErr);
 });
 
 // ==================== ПАСХАЛКИ И ПОДКОЛЫ ====================
