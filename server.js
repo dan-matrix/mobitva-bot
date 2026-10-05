@@ -928,12 +928,36 @@ function trackGroupMember(msg) {
     if (!msg.from || msg.from.is_bot) return;
     const username = (msg.from.username || '').toLowerCase();
     if (WHINER_EXCLUDED_USERNAMES.includes(username)) return;
-    if (!groupMembers.has(msg.chat.id)) groupMembers.set(msg.chat.id, new Map());
+
     const name = msg.from.first_name + (msg.from.last_name ? ' ' + msg.from.last_name : '');
+    const already = groupMembers.get(msg.chat.id)?.get(msg.from.id);
+
+    if (!groupMembers.has(msg.chat.id)) groupMembers.set(msg.chat.id, new Map());
     groupMembers.get(msg.chat.id).set(msg.from.id, name);
+
+    // Пишем в базу только если это новый участник или у него поменялось имя —
+    // не дёргаем базу на каждое сообщение от уже известных людей.
+    if (already !== name) {
+        supabaseAdmin.from('group_members')
+            .upsert([{ chat_id: msg.chat.id, user_id: msg.from.id, user_name: name }], { onConflict: 'chat_id,user_id' })
+            .then(({ error }) => { if (error) console.error('trackGroupMember save:', error.message); });
+    }
 }
 
 bot.on('message', (msg) => trackGroupMember(msg));
+
+// При старте бота подтягиваем из базы тех, кого уже видели раньше —
+// чтобы после перезапуска не ждать, пока кто-то снова напишет в чат.
+async function loadGroupMembersFromDb() {
+    const { data, error } = await supabaseAdmin.from('group_members').select('*');
+    if (error) { console.error('loadGroupMembersFromDb:', error.message); return; }
+    for (const row of data || []) {
+        if (!groupMembers.has(row.chat_id)) groupMembers.set(row.chat_id, new Map());
+        groupMembers.get(row.chat_id).set(row.user_id, row.user_name);
+    }
+    console.log(`Загружено участников групп из базы: ${(data || []).length}`);
+}
+loadGroupMembersFromDb().catch(e => console.error('Ошибка загрузки участников групп:', e.message));
 
 function todayKey() {
     return new Date().toISOString().slice(0, 10); // YYYY-MM-DD по UTC
