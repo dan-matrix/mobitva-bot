@@ -661,7 +661,7 @@ bot.onText(/^\/start/, (msg) => {
         '/timers — персонажи и их таймеры с кнопками (перезапустить/удалить)\n' +
         '/timer_add — добавить таймер (время: минуты, часы или дни)\n' +
         '/char_add — создать нового персонажа\n\n' +
-        '🤖 /ask <вопрос> — спросить остроумного ИИ (работает и в группах)\n\n' +
+        '🤖 /ask <вопрос> — спросить остроумного ИИ. В группах можно и без команды: ответь на моё сообщение, упомяни меня через @ или напиши «хелп, вопрос» / «бот, вопрос»\n\n' +
         `Сайт: ${SITE_URL}`
     ).catch(logSendErr);
 });
@@ -1203,7 +1203,7 @@ function aiTakeSlot() {
     return true;
 }
 
-async function askAI(question) {
+async function askAI(question, context) {
     const res = await fetch(`${AI_BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -1216,6 +1216,7 @@ async function askAI(question) {
             temperature: 1.0,
             messages: [
                 { role: 'system', content: AI_SYSTEM_PROMPT },
+                ...(context ? [{ role: 'assistant', content: String(context).slice(0, 1000) }] : []),
                 { role: 'user', content: question },
             ],
         }),
@@ -1265,8 +1266,51 @@ async function handleAiToggle(msg, enabled) {
 bot.onText(/^\/ask_on(?:@\w+)?$/, (msg) => handleAiToggle(msg, true));
 bot.onText(/^\/ask_off(?:@\w+)?$/, (msg) => handleAiToggle(msg, false));
 
-// /ask вопрос  — или ответом (reply) на чьё-то сообщение: /ask
-bot.onText(/^\/ask(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
+// ----- Позывные: слова, на которые бот отзывается в группе (как «пёс» у соседнего бота) -----
+// СТРОГИЕ: после слова обязательно знак (запятая, двоеточие, !, тире), чтобы не срабатывать на обычную речь
+//          («инфо, у кого есть меч?» — сработает, «инфо у кого есть меч» — нет).
+// МЯГКИЕ:  знак необязателен («хелп как качать мага» тоже сработает).
+// Список можно свободно править.
+const AI_CALLSIGNS_STRICT = ['бот', 'ботик', 'бот-шутник', 'помощь', 'инфо', 'info'];
+const AI_CALLSIGNS_LOOSE = ['мобитва хелп', 'мобитва помощь', 'мобитва инфо', 'мобитва help', 'хелп', 'help'];
+
+function buildCallsignRegex() {
+    const esc = (w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+    const sortLong = (arr) => [...arr].sort((a, b) => b.length - a.length).map(esc);
+    const strict = sortLong(AI_CALLSIGNS_STRICT).join('|');
+    const loose = sortLong(AI_CALLSIGNS_LOOSE).join('|');
+    // группа 1 — слово, группа 2 — остальной текст
+    return new RegExp(
+        '^\\s*(?:(?:' + loose + ')(?:\\s*[,:!\\-—]\\s*|\\s+)|(?:' + strict + ')\\s*[,:!\\-—]\\s*)([\\s\\S]+)$', 'i');
+}
+function buildBareCallsignRegex() {
+    const all = [...AI_CALLSIGNS_STRICT, ...AI_CALLSIGNS_LOOSE]
+        .sort((a, b) => b.length - a.length)
+        .map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+'));
+    return new RegExp('^\\s*(?:' + all.join('|') + ')\\s*[?!.,]*\\s*$', 'i');
+}
+const AI_CALLSIGN_RE = buildCallsignRegex();
+const AI_BARE_CALLSIGN_RE = buildBareCallsignRegex();
+
+// Возвращает null (это не обращение), {question: '...'} или {question: null} (позвали без вопроса)
+function matchAiCallsign(text) {
+    if (AI_BARE_CALLSIGN_RE.test(text)) return { question: null };
+    const m = text.match(AI_CALLSIGN_RE);
+    if (m && m[1] && m[1].trim()) return { question: m[1].trim() };
+    return null;
+}
+
+const AI_HELP_TEXT =
+    '🤖 Я бот-справочник по МоБитве.\n\n' +
+    '🔍 Поиск предмета: /item название (в личке — просто напиши название)\n' +
+    '⏱ Таймеры персонажей: пиши мне в личку, команда /timers\n' +
+    '😤 Нытик дня: /nytik\n' +
+    '🧠 Спросить ИИ: /ask вопрос, или «хелп, вопрос», или ответь на моё сообщение\n\n' +
+    'Полная справка: /start';
+
+// Общая логика: проверки, лимиты, запрос к ИИ, отправка ответа.
+// context — предыдущая реплика бота (если человек отвечает на сообщение бота).
+async function runAiQuestion(msg, question, context) {
     const chatId = msg.chat.id;
     const userId = msg.from && msg.from.id;
 
@@ -1279,15 +1323,8 @@ bot.onText(/^\/ask(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
         return;
     }
 
-    let question = match[1] ? match[1].trim() : '';
-    if (!question && msg.reply_to_message && msg.reply_to_message.text) {
-        question = msg.reply_to_message.text.trim();
-    }
-    if (!question) {
-        bot.sendMessage(chatId, 'Напиши вопрос после команды, например: /ask почему у меня опять упал таймер?\nИли ответь командой /ask на чьё-то сообщение.').catch(logSendErr);
-        return;
-    }
-    question = question.slice(0, AI_MAX_QUESTION);
+    question = (question || '').trim().slice(0, AI_MAX_QUESTION);
+    if (!question) return;
 
     // антиспам: не чаще раза в 15 секунд на человека
     const now = Date.now();
@@ -1301,16 +1338,97 @@ bot.onText(/^\/ask(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
 
     bot.sendChatAction(chatId, 'typing').catch(() => {});
     try {
-        let answer = await askAI(question);
+        let answer = await askAI(question, context);
         if (!answer) {
             bot.sendMessage(chatId, '🤔 Модель промолчала. Попробуй спросить иначе.', { reply_to_message_id: msg.message_id }).catch(logSendErr);
             return;
         }
         if (answer.length > 3500) answer = answer.slice(0, 3500) + '…';
-        bot.sendMessage(chatId, answer, { reply_to_message_id: msg.message_id }).catch(logSendErr);
+        const sent = await bot.sendMessage(chatId, answer, { reply_to_message_id: msg.message_id });
+        rememberAiMessage(chatId, sent.message_id);
     } catch (e) {
         console.error('ask:', e.message);
         bot.sendMessage(chatId, '🤖 Мозг временно недоступен, попробуйте позже.').catch(logSendErr);
+    }
+}
+
+// Запоминаем id сообщений бота, которые были ответами ИИ, чтобы понимать,
+// что человек продолжает диалог (отвечает именно на реплику ИИ, а не на, скажем, «нытика дня»).
+const aiMessageIds = new Set();
+function rememberAiMessage(chatId, messageId) {
+    aiMessageIds.add(`${chatId}:${messageId}`);
+    if (aiMessageIds.size > 1000) aiMessageIds.delete(aiMessageIds.values().next().value);
+}
+
+// /ask вопрос  — или ответом (reply) на чьё-то сообщение: /ask
+bot.onText(/^\/ask(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
+    let question = match[1] ? match[1].trim() : '';
+    if (!question && msg.reply_to_message && msg.reply_to_message.text) {
+        question = msg.reply_to_message.text.trim();
+    }
+    if (!question) {
+        bot.sendMessage(msg.chat.id,
+            'Напиши вопрос после команды, например: /ask почему у меня опять упал таймер?\n' +
+            'Или ответь командой /ask на чьё-то сообщение.\n' +
+            'В группах со мной можно говорить и без команды: ответь на моё сообщение, ' +
+            'упомяни меня через @ или начни фразу со слова «хелп,» / «бот,».').catch(logSendErr);
+        return;
+    }
+    await runAiQuestion(msg, question, null);
+});
+
+// Разговор без команды (только в группах):
+//  1) ответ (reply) на сообщение ИИ — продолжение диалога;
+//  2) упоминание @имя_бота;
+//  3) обращение «бот, ...» в начале сообщения (работает, только если у бота выключен режим приватности).
+bot.on('message', async (msg) => {
+    try {
+        if (!msg.text || msg.text.startsWith('/')) return;
+        if (!isGroupChat(msg)) return;
+        if (!msg.from || msg.from.is_bot) return;
+        if (!aiConfigured()) return;
+
+        const username = botInfo && botInfo.username ? botInfo.username : '';
+        let question = null;
+        let context = null;
+
+        // 1) ответ на реплику ИИ
+        const rt = msg.reply_to_message;
+        if (rt && rt.from && botInfo && rt.from.id === botInfo.id &&
+            aiMessageIds.has(`${msg.chat.id}:${rt.message_id}`)) {
+            question = msg.text;
+            context = rt.text || null;
+        }
+
+        // 2) упоминание @бота
+        if (question === null && username) {
+            const mention = new RegExp('@' + username + '\\b', 'i');
+            if (mention.test(msg.text)) {
+                question = msg.text.replace(new RegExp('@' + username + '\\b', 'ig'), '').trim();
+            }
+        }
+
+        // 3) позывные: «хелп, ...», «помощь, ...», «мобитва хелп, ...», «инфо, ...», «бот, ...»
+        if (question === null) {
+            const call = matchAiCallsign(msg.text);
+            if (call) {
+                if (call.question) {
+                    question = call.question;
+                } else {
+                    // позывной без вопроса («хелп», «помощь») — просто короткая справка, без траты лимита ИИ
+                    const key = 'help:' + msg.chat.id;
+                    if (Date.now() - (aiCooldown.get(key) || 0) > 20000) {
+                        aiCooldown.set(key, Date.now());
+                        bot.sendMessage(msg.chat.id, AI_HELP_TEXT, { reply_to_message_id: msg.message_id }).catch(logSendErr);
+                    }
+                    return;
+                }
+            }
+        }
+
+        if (question) await runAiQuestion(msg, question, context);
+    } catch (e) {
+        console.error('ai-chat:', e.message);
     }
 });
 
