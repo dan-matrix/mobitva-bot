@@ -1,0 +1,8 @@
+# Секреты — никогда не заливать в GitHub
+.env
+.env.*
+*.pem
+
+node_modules/
+*.log
+.DS_Store
