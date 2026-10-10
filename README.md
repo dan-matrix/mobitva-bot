@@ -40,6 +40,17 @@ Render сам подхватит новый код из GitHub и перезап
 4. Попробуй `/timer_add` — пройди мастер добавления.
 5. Поставь таймер на 1-2 минуты и подожди — бот должен сам прислать уведомление, когда время выйдет.
 
+## ИИ-ответы (/ask)
+1. Supabase → SQL Editor → выполни `sql/006_ai_settings.sql`.
+2. Получи бесплатный ключ (например, Google AI Studio: aistudio.google.com).
+3. В Render → Environment добавь переменные:
+   - `AI_API_KEY` — ключ провайдера;
+   - `AI_BASE_URL` — адрес API (для Gemini: `https://generativelanguage.googleapis.com/v1beta/openai`);
+   - `AI_MODEL` — название модели (для Gemini — актуальная Flash-модель из AI Studio);
+   - `AI_DAILY_LIMIT` — необязательно, всего запросов в сутки (по умолчанию 40).
+4. Команды: `/ask вопрос`, ответом на сообщение `/ask`, для админов группы `/ask_on` и `/ask_off`.
+Ключи нельзя хранить в коде и заливать на GitHub — только в переменных окружения Render.
+
 ## Если что-то не работает
 - Проверь логи в Render (вкладка **Logs**).
 - Убедись, что все три переменные окружения заполнены верно: `BOT_TOKEN`, `PUBLIC_URL`, `SUPABASE_SERVICE_ROLE_KEY`.

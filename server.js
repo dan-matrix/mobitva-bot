@@ -1,6 +1,17 @@
 // ====================================================================
 // Telegram-бот для Mobitva.help
-
+//
+// 1) Поиск: пишешь название предмета/руны/тотема и т.д. — бот ищет по
+//    всей базе сразу, прощает опечатки.
+// 2) Привязка аккаунта: /link КОД — привязывает Telegram к аккаунту
+//    на сайте (код выдаётся в личном кабинете на сайте).
+// 3) Таймеры: /timers, /timer_add, /timer_del, /timer_restart —
+//    управление своими таймерами прямо из чата.
+// 4) Уведомления: когда таймер истекает, бот сам пишет в личку.
+//
+// Работает в режиме webhook (Telegram сам стучится на наш сервер),
+// чтобы бесплатный хостинг (Render) считал его обычным веб-сервисом.
+// ====================================================================
 
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
@@ -541,6 +552,9 @@ app.listen(PORT, () => {
         { command: 'botstatus', description: 'Диагностика: видит ли бот сообщения группы' },
         { command: 'nytik_on', description: 'Включить "нытика дня" (только админы)' },
         { command: 'nytik_off', description: 'Выключить "нытика дня" (только админы)' },
+        { command: 'ask', description: 'Спросить ИИ: /ask <вопрос>' },
+        { command: 'ask_on', description: 'Включить ИИ-ответы в группе (только админы)' },
+        { command: 'ask_off', description: 'Выключить ИИ-ответы в группе (только админы)' },
     ]).catch(err => console.error('Не удалось задать список команд:', err.message));
 });
 
@@ -647,6 +661,7 @@ bot.onText(/^\/start/, (msg) => {
         '/timers — персонажи и их таймеры с кнопками (перезапустить/удалить)\n' +
         '/timer_add — добавить таймер (время: минуты, часы или дни)\n' +
         '/char_add — создать нового персонажа\n\n' +
+        '🤖 /ask <вопрос> — спросить остроумного ИИ (работает и в группах)\n\n' +
         `Сайт: ${SITE_URL}`
     ).catch(logSendErr);
 });
@@ -1149,6 +1164,154 @@ bot.onText(/^\/nytik(?:@\w+)?$/, async (msg) => {
         return;
     }
     bot.sendMessage(msg.chat.id, randomWhinerAnnouncement(record), { parse_mode: 'HTML' }).catch(logSendErr);
+});
+
+// ==================== ИИ-ОТВЕТЫ: /ask ====================
+// Работает с любым провайдером, совместимым с форматом OpenAI
+// (Google Gemini, OpenRouter, Groq, DeepSeek и т.д.). Настраивается
+// переменными окружения на Render: AI_API_KEY, AI_BASE_URL, AI_MODEL.
+// Если AI_API_KEY не задан — команда вежливо сообщает, что ИИ не подключён.
+
+const AI_API_KEY = process.env.AI_API_KEY || '';
+const AI_BASE_URL = (process.env.AI_BASE_URL || '').replace(/\/+$/, '');
+const AI_MODEL = process.env.AI_MODEL || '';
+const AI_DAILY_LIMIT = parseInt(process.env.AI_DAILY_LIMIT || '40', 10); // всего запросов в сутки на весь бот
+const AI_COOLDOWN_MS = 15000; // один вопрос от одного человека раз в 15 секунд
+const AI_MAX_QUESTION = 500;  // длина вопроса, символов
+
+const AI_SYSTEM_PROMPT =
+    'Ты остроумный, слегка язвительный бот в чате игроков браузерной игры «МоБитва». ' +
+    'Отвечай коротко: 1-3 предложения. Шути и подкалывай по-дружески, но без грубых оскорблений, ' +
+    'без политики, без 18+ и без реальной травли людей. Если вопрос серьёзный, отвечай по делу, ' +
+    'но с лёгкой иронией. Отвечай на том языке, на котором задан вопрос. ' +
+    'Не используй Markdown-разметку (звёздочки, решётки, обратные кавычки).';
+
+const aiCooldown = new Map(); // userId -> время последнего вопроса
+let aiDay = new Date().getUTCDate();
+let aiCount = 0;
+
+function aiConfigured() {
+    return !!(AI_API_KEY && AI_BASE_URL && AI_MODEL);
+}
+
+// true — можно спрашивать, false — дневной лимит исчерпан
+function aiTakeSlot() {
+    const today = new Date().getUTCDate();
+    if (today !== aiDay) { aiDay = today; aiCount = 0; }
+    if (aiCount >= AI_DAILY_LIMIT) return false;
+    aiCount++;
+    return true;
+}
+
+async function askAI(question) {
+    const res = await fetch(`${AI_BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${AI_API_KEY}`,
+        },
+        body: JSON.stringify({
+            model: AI_MODEL,
+            max_tokens: 800, // запас: некоторые модели тратят часть на «размышления»
+            temperature: 1.0,
+            messages: [
+                { role: 'system', content: AI_SYSTEM_PROMPT },
+                { role: 'user', content: question },
+            ],
+        }),
+        signal: AbortSignal.timeout(25000),
+    });
+    if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        throw new Error(`AI HTTP ${res.status}: ${body.slice(0, 200)}`);
+    }
+    const data = await res.json();
+    let text = data && data.choices && data.choices[0] && data.choices[0].message
+        ? (data.choices[0].message.content || '') : '';
+    text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim(); // часть моделей выводит рассуждения
+    return text;
+}
+
+async function isAiEnabled(chatId) {
+    const { data, error } = await supabaseAdmin.from('ai_settings').select('enabled').eq('chat_id', chatId).maybeSingle();
+    if (error) { console.error('isAiEnabled:', error.message); return true; }
+    return data ? data.enabled : true; // по умолчанию включено, пока админ явно не выключил
+}
+
+async function setAiEnabled(chatId, enabled) {
+    const { error } = await supabaseAdmin.from('ai_settings').upsert([{ chat_id: chatId, enabled }], { onConflict: 'chat_id' });
+    if (error) console.error('setAiEnabled:', error.message);
+    return !error;
+}
+
+function isGroupChat(msg) {
+    return msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+}
+
+async function handleAiToggle(msg, enabled) {
+    if (!isGroupChat(msg)) {
+        bot.sendMessage(msg.chat.id, 'Эта команда работает только в групповом чате.').catch(logSendErr);
+        return;
+    }
+    if (!(await isGroupAdmin(msg))) {
+        bot.sendMessage(msg.chat.id, '🔒 Включать/выключать ИИ-ответы могут только администраторы группы.').catch(logSendErr);
+        return;
+    }
+    const ok = await setAiEnabled(msg.chat.id, enabled);
+    const done = enabled ? '✅ ИИ-ответы (/ask) включены в этой группе.' : '🔕 ИИ-ответы (/ask) выключены в этой группе.';
+    bot.sendMessage(msg.chat.id, ok ? done : '❌ Не удалось сохранить настройку.').catch(logSendErr);
+}
+
+bot.onText(/^\/ask_on(?:@\w+)?$/, (msg) => handleAiToggle(msg, true));
+bot.onText(/^\/ask_off(?:@\w+)?$/, (msg) => handleAiToggle(msg, false));
+
+// /ask вопрос  — или ответом (reply) на чьё-то сообщение: /ask
+bot.onText(/^\/ask(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const userId = msg.from && msg.from.id;
+
+    if (!aiConfigured()) {
+        bot.sendMessage(chatId, '🤖 ИИ пока не подключён к этому боту.').catch(logSendErr);
+        return;
+    }
+    if (isGroupChat(msg) && !(await isAiEnabled(chatId))) {
+        bot.sendMessage(chatId, '🔕 ИИ-ответы выключены в этой группе (включить может админ: /ask_on).').catch(logSendErr);
+        return;
+    }
+
+    let question = match[1] ? match[1].trim() : '';
+    if (!question && msg.reply_to_message && msg.reply_to_message.text) {
+        question = msg.reply_to_message.text.trim();
+    }
+    if (!question) {
+        bot.sendMessage(chatId, 'Напиши вопрос после команды, например: /ask почему у меня опять упал таймер?\nИли ответь командой /ask на чьё-то сообщение.').catch(logSendErr);
+        return;
+    }
+    question = question.slice(0, AI_MAX_QUESTION);
+
+    // антиспам: не чаще раза в 15 секунд на человека
+    const now = Date.now();
+    if (userId && now - (aiCooldown.get(userId) || 0) < AI_COOLDOWN_MS) return;
+    if (userId) aiCooldown.set(userId, now);
+
+    if (!aiTakeSlot()) {
+        bot.sendMessage(chatId, '😴 На сегодня моё остроумие закончилось. Приходите завтра.').catch(logSendErr);
+        return;
+    }
+
+    bot.sendChatAction(chatId, 'typing').catch(() => {});
+    try {
+        let answer = await askAI(question);
+        if (!answer) {
+            bot.sendMessage(chatId, '🤔 Модель промолчала. Попробуй спросить иначе.', { reply_to_message_id: msg.message_id }).catch(logSendErr);
+            return;
+        }
+        if (answer.length > 3500) answer = answer.slice(0, 3500) + '…';
+        bot.sendMessage(chatId, answer, { reply_to_message_id: msg.message_id }).catch(logSendErr);
+    } catch (e) {
+        console.error('ask:', e.message);
+        bot.sendMessage(chatId, '🤖 Мозг временно недоступен, попробуйте позже.').catch(logSendErr);
+    }
 });
 
 // ==================== ПАСХАЛКИ И ПОДКОЛЫ ====================
