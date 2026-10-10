@@ -524,11 +524,20 @@ app.post('/webhook', (req, res) => {
 app.get('/', (req, res) => res.send('Mobitva bot is alive'));
 app.get('/ping', (req, res) => res.send('pong'));
 
+let botInfo = null; // данные о самом боте (id, username, can_read_all_group_messages)
+
 app.listen(PORT, () => {
     console.log(`Сервер бота запущен на порту ${PORT}`);
     bot.setWebHook(`${PUBLIC_URL}/webhook`)
         .then(() => console.log('Webhook установлен:', `${PUBLIC_URL}/webhook`))
         .catch(err => console.error('Не удалось установить webhook:', err.message));
+    bot.getMe().then(me => {
+        botInfo = me;
+        console.log(`Бот: @${me.username}. Видит все сообщения в группах: ` +
+            (me.can_read_all_group_messages
+                ? 'ДА (режим приватности выключен)'
+                : 'НЕТ — режим приватности ВКЛЮЧЁН, в группах бот получает только команды вида /команда@имя_бота'));
+    }).catch(err => console.error('getMe:', err.message));
     bot.setMyCommands([
         { command: 'start', description: 'Помощь и как пользоваться ботом' },
         { command: 'item', description: 'Поиск: /item <название>' },
@@ -540,6 +549,9 @@ app.listen(PORT, () => {
         { command: 'watch_game', description: 'Следить, не упала ли игра (mmobitva.ru/.net)' },
         { command: 'unwatch_game', description: 'Выключить уведомления о доступности игры' },
         { command: 'nytik', description: 'Нытик дня (в группе)' },
+        { command: 'botstatus', description: 'Диагностика: видит ли бот сообщения группы' },
+        { command: 'nytik_on', description: 'Включить "нытика дня" (только админы)' },
+        { command: 'nytik_off', description: 'Выключить "нытика дня" (только админы)' },
     ]).catch(err => console.error('Не удалось задать список команд:', err.message));
 });
 
@@ -1027,6 +1039,7 @@ function randomWhinerAlready(record) {
 // объявлен ли уже сегодняшний нытик; если нет, выбираем и объявляем.
 async function checkDailyWhiner() {
     for (const chatId of groupMembers.keys()) {
+        if (!(await isWhinerEnabled(chatId))) continue;
         const existing = await getTodaysWhiner(chatId);
         if (existing) continue;
         const record = await pickAndSaveWhiner(chatId);
@@ -1039,9 +1052,90 @@ setInterval(() => checkDailyWhiner().catch(e => console.error('Ошибка "н�
 
 // Команда для ручного запроса в группе: если нытик дня ещё не объявлен — объявляет
 // прямо сейчас; если уже объявлен — просто напоминает, кто сегодня победил.
-bot.onText(/^\/nytik/, async (msg) => {
+// Диагностика: видит ли бот сообщения группы, админ ли он, сколько людей запомнил.
+// В группе с включённым режимом приватности писать надо так: /botstatus@имя_бота
+bot.onText(/^\/botstatus(?:@\w+)?$/, async (msg) => {
+    try {
+        const me = botInfo || await bot.getMe();
+        botInfo = me;
+        const lines = [`🔧 Диагностика @${me.username}`, ''];
+        lines.push(me.can_read_all_group_messages
+            ? '✅ Режим приватности выключен: бот видит все сообщения в группах.'
+            : '⚠️ Режим приватности ВКЛЮЧЁН: в группах бот видит только команды /команда@имя_бота. ' +
+              'Выключи в @BotFather (Bot Settings → Group Privacy → Turn off) и удали бота из группы и добавь заново — ' +
+              'либо просто сделай бота администратором группы.');
+
+        if (msg.chat.type === 'group' || msg.chat.type === 'supergroup') {
+            const member = await bot.getChatMember(msg.chat.id, me.id);
+            const isAdmin = member.status === 'administrator' || member.status === 'creator';
+            lines.push(isAdmin
+                ? '✅ Бот — администратор этой группы (видит все сообщения и может проверять права админов).'
+                : 'ℹ️ Бот — обычный участник группы. Если команды без @имени не работают — сделай его админом.');
+            const known = groupMembers.get(msg.chat.id)?.size || 0;
+            lines.push(`👥 Участников, которых бот запомнил для «нытика дня»: ${known}`);
+        }
+        bot.sendMessage(msg.chat.id, lines.join('\n')).catch(logSendErr);
+    } catch (e) {
+        console.error('botstatus:', e.message);
+        bot.sendMessage(msg.chat.id, '❌ Не удалось получить диагностику.').catch(logSendErr);
+    }
+});
+
+async function isGroupAdmin(chatId, userId) {
+    try {
+        const member = await bot.getChatMember(chatId, userId);
+        return member.status === 'administrator' || member.status === 'creator';
+    } catch (e) {
+        console.error('isGroupAdmin:', e.message);
+        return false;
+    }
+}
+
+async function isWhinerEnabled(chatId) {
+    const { data, error } = await supabaseAdmin.from('whiner_settings').select('enabled').eq('chat_id', chatId).maybeSingle();
+    if (error) { console.error('isWhinerEnabled:', error.message); return true; }
+    return data ? data.enabled : true; // по умолчанию включено, пока админ явно не выключил
+}
+
+async function setWhinerEnabled(chatId, enabled) {
+    const { error } = await supabaseAdmin.from('whiner_settings').upsert([{ chat_id: chatId, enabled }], { onConflict: 'chat_id' });
+    if (error) console.error('setWhinerEnabled:', error.message);
+    return !error;
+}
+
+bot.onText(/^\/nytik_on/, async (msg) => {
     if (msg.chat.type !== 'group' && msg.chat.type !== 'supergroup') {
         bot.sendMessage(msg.chat.id, 'Эта команда работает только в групповом чате.').catch(logSendErr);
+        return;
+    }
+    if (!(await isGroupAdmin(msg.chat.id, msg.from.id))) {
+        bot.sendMessage(msg.chat.id, '🔒 Включать/выключать "нытика дня" могут только администраторы группы.').catch(logSendErr);
+        return;
+    }
+    const ok = await setWhinerEnabled(msg.chat.id, true);
+    bot.sendMessage(msg.chat.id, ok ? '✅ "Нытик дня" включён в этой группе.' : '❌ Не удалось сохранить настройку.').catch(logSendErr);
+});
+
+bot.onText(/^\/nytik_off/, async (msg) => {
+    if (msg.chat.type !== 'group' && msg.chat.type !== 'supergroup') {
+        bot.sendMessage(msg.chat.id, 'Эта команда работает только в групповом чате.').catch(logSendErr);
+        return;
+    }
+    if (!(await isGroupAdmin(msg.chat.id, msg.from.id))) {
+        bot.sendMessage(msg.chat.id, '🔒 Включать/выключать "нытика дня" могут только администраторы группы.').catch(logSendErr);
+        return;
+    }
+    const ok = await setWhinerEnabled(msg.chat.id, false);
+    bot.sendMessage(msg.chat.id, ok ? '🔕 "Нытик дня" выключен в этой группе.' : '❌ Не удалось сохранить настройку.').catch(logSendErr);
+});
+
+bot.onText(/^\/nytik(?:@\w+)?$/, async (msg) => {
+    if (msg.chat.type !== 'group' && msg.chat.type !== 'supergroup') {
+        bot.sendMessage(msg.chat.id, 'Эта команда работает только в групповом чате.').catch(logSendErr);
+        return;
+    }
+    if (!(await isWhinerEnabled(msg.chat.id))) {
+        bot.sendMessage(msg.chat.id, '🔕 "Нытик дня" сейчас выключен в этой группе (включить может админ: /nytik_on).').catch(logSendErr);
         return;
     }
     const existing = await getTodaysWhiner(msg.chat.id);
@@ -1051,7 +1145,7 @@ bot.onText(/^\/nytik/, async (msg) => {
     }
     const record = await pickAndSaveWhiner(msg.chat.id);
     if (!record) {
-        bot.sendMessage(msg.chat.id, 'Пока не видел здесь никого, кроме исключённых — не из кого выбирать 🤷').catch(logSendErr);
+        bot.sendMessage(msg.chat.id, 'Пока здесь нет ноевидных, — не из кого выбирать 🤷').catch(logSendErr);
         return;
     }
     bot.sendMessage(msg.chat.id, randomWhinerAnnouncement(record), { parse_mode: 'HTML' }).catch(logSendErr);
