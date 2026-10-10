@@ -1,17 +1,6 @@
 // ====================================================================
 // Telegram-бот для Mobitva.help
-//
-// 1) Поиск: пишешь название предмета/руны/тотема и т.д. — бот ищет по
-//    всей базе сразу, прощает опечатки.
-// 2) Привязка аккаунта: /link КОД — привязывает Telegram к аккаунту
-//    на сайте (код выдаётся в личном кабинете на сайте).
-// 3) Таймеры: /timers, /timer_add, /timer_del, /timer_restart —
-//    управление своими таймерами прямо из чата.
-// 4) Уведомления: когда таймер истекает, бот сам пишет в личку.
-//
-// Работает в режиме webhook (Telegram сам стучится на наш сервер),
-// чтобы бесплатный хостинг (Render) считал его обычным веб-сервисом.
-// ====================================================================
+
 
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
@@ -1081,12 +1070,23 @@ bot.onText(/^\/botstatus(?:@\w+)?$/, async (msg) => {
     }
 });
 
-async function isGroupAdmin(chatId, userId) {
+// Работает и когда бот НЕ админ группы: getChatAdministrators доступен
+// любому участнику-боту, в отличие от getChatMember для чужих пользователей.
+async function isGroupAdmin(msg) {
+    // Анонимный админ: сообщение приходит от имени самой группы
+    if (msg.sender_chat && msg.sender_chat.id === msg.chat.id) return true;
+    if (!msg.from) return false;
     try {
-        const member = await bot.getChatMember(chatId, userId);
+        const admins = await bot.getChatAdministrators(msg.chat.id);
+        return admins.some(a => a.user && a.user.id === msg.from.id);
+    } catch (e) {
+        console.error('isGroupAdmin: getChatAdministrators упал:', e.message);
+    }
+    try {
+        const member = await bot.getChatMember(msg.chat.id, msg.from.id);
         return member.status === 'administrator' || member.status === 'creator';
     } catch (e) {
-        console.error('isGroupAdmin:', e.message);
+        console.error('isGroupAdmin: getChatMember упал:', e.message);
         return false;
     }
 }
@@ -1108,7 +1108,7 @@ bot.onText(/^\/nytik_on/, async (msg) => {
         bot.sendMessage(msg.chat.id, 'Эта команда работает только в групповом чате.').catch(logSendErr);
         return;
     }
-    if (!(await isGroupAdmin(msg.chat.id, msg.from.id))) {
+    if (!(await isGroupAdmin(msg))) {
         bot.sendMessage(msg.chat.id, '🔒 Включать/выключать "нытика дня" могут только администраторы группы.').catch(logSendErr);
         return;
     }
@@ -1121,7 +1121,7 @@ bot.onText(/^\/nytik_off/, async (msg) => {
         bot.sendMessage(msg.chat.id, 'Эта команда работает только в групповом чате.').catch(logSendErr);
         return;
     }
-    if (!(await isGroupAdmin(msg.chat.id, msg.from.id))) {
+    if (!(await isGroupAdmin(msg))) {
         bot.sendMessage(msg.chat.id, '🔒 Включать/выключать "нытика дня" могут только администраторы группы.').catch(logSendErr);
         return;
     }
@@ -1145,7 +1145,7 @@ bot.onText(/^\/nytik(?:@\w+)?$/, async (msg) => {
     }
     const record = await pickAndSaveWhiner(msg.chat.id);
     if (!record) {
-        bot.sendMessage(msg.chat.id, 'Пока здесь нет ноевидных, — не из кого выбирать 🤷').catch(logSendErr);
+        bot.sendMessage(msg.chat.id, 'Пока не видел здесь никого, кроме исключённых — не из кого выбирать 🤷').catch(logSendErr);
         return;
     }
     bot.sendMessage(msg.chat.id, randomWhinerAnnouncement(record), { parse_mode: 'HTML' }).catch(logSendErr);
