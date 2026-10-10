@@ -18,6 +18,8 @@ const TelegramBot = require('node-telegram-bot-api');
 const { createClient } = require('@supabase/supabase-js');
 const WebSocket = require('ws');
 const Fuse = require('fuse.js');
+const fs = require('fs');
+const path = require('path');
 
 let sharp = null;
 try {
@@ -1233,7 +1235,8 @@ function aiTakeSlot() {
     return true;
 }
 
-async function askAI(question, context, userName) {
+async function askAI(question, context, userName, opts) {
+    opts = opts || {};
     const res = await fetch(`${AI_BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -1243,9 +1246,9 @@ async function askAI(question, context, userName) {
         body: JSON.stringify({
             model: AI_MODEL,
             max_tokens: 800, // запас: некоторые модели тратят часть на «размышления»
-            temperature: 1.0,
+            temperature: typeof opts.temperature === 'number' ? opts.temperature : 1.0,
             messages: [
-                { role: 'system', content: aiSystemPromptFor(userName) },
+                { role: 'system', content: aiSystemPromptFor(userName) + (opts.extraSystem || '') },
                 ...(context ? [{ role: 'assistant', content: String(context).slice(0, 1000) }] : []),
                 { role: 'user', content: question },
             ],
@@ -1338,6 +1341,138 @@ const AI_HELP_TEXT =
     '🧠 Спросить ИИ: /ask вопрос, или «хелп, вопрос», или ответь на моё сообщение\n\n' +
     'Полная справка: /start';
 
+// ==================== ИИ + БАЗА ЗНАНИЙ ====================
+// Перед запросом к ИИ ищем в базе сайта (allEntries) записи, о которых спрашивает человек,
+// и подкладываем их модели как факты. Так «хелп, с какого лв палица героя» получает точный
+// ответ из базы, а не выдумку. Плюс файл knowledge.md — общие сведения (как играть и т.п.).
+
+let AI_KNOWLEDGE = '';
+try {
+    AI_KNOWLEDGE = fs.readFileSync(path.join(__dirname, 'knowledge.md'), 'utf8').trim().slice(0, 20000);
+    console.log(`knowledge.md загружен (${AI_KNOWLEDGE.length} символов).`);
+} catch (e) {
+    console.log('knowledge.md не найден — общие сведения об игре ИИ не передаются.');
+}
+
+// слова, которые не несут смысла для поиска предмета
+const AI_FUNC_WORDS = new Set(['и', 'в', 'во', 'на', 'с', 'со', 'из', 'для', 'от', 'до', 'по', 'за', 'к', 'у', 'а', 'о', 'об', 'не', 'ли', 'же', 'то']);
+const AI_STOP_WORDS = new Set([
+    'как', 'что', 'где', 'какой', 'какая', 'какие', 'какое', 'какого', 'каком', 'сделать', 'делать', 'крафт', 'скрафтить',
+    'создать', 'получить', 'достать', 'взять', 'добыть', 'нужно', 'надо', 'можно', 'мне', 'мой', 'моя', 'это', 'есть',
+    'ну', 'тут', 'там', 'кто', 'почему', 'зачем', 'сколько', 'когда', 'подскажи', 'подскажите', 'скажи', 'плиз',
+    'пожалуйста', 'хелп', 'помощь', 'инфо', 'бот', 'мобитва', 'мобитве', 'мобитву', 'игра', 'игре', 'играть',
+    'лв', 'лвл', 'левел', 'уровень', 'уровня', 'уровне', 'help', 'info',
+]);
+
+function aiNorm(s) {
+    return String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+// грубая «основа» слова, чтобы «палицу» совпадало с «палица», а «героя» с «герой»
+function aiStem(w) {
+    return w.length <= 3 ? w : w.slice(0, Math.max(4, w.length - 2));
+}
+function aiWordMatch(a, b) {
+    if (Math.min(a.length, b.length) < 3) return a === b;
+    return a.startsWith(b) || b.startsWith(a);
+}
+
+const aiNameTokenCache = new WeakMap();
+function aiNameTokens(row) {
+    let t = aiNameTokenCache.get(row);
+    if (!t) {
+        t = aiNorm(row.name).split(' ').filter(w => w && !AI_FUNC_WORDS.has(w)).map(aiStem);
+        aiNameTokenCache.set(row, t);
+    }
+    return t;
+}
+
+// Возвращает: null — база ещё не загружена; [] — ничего не найдено; [строки…] — найденные записи
+function aiFindEntries(text) {
+    if (!searchIndex || allEntries.length === 0) return null;
+    const qTokens = aiNorm(text).split(' ').filter(Boolean).map(aiStem);
+
+    // 1) все слова из названия записи встречаются в вопросе
+    let found = [];
+    for (const row of allEntries) {
+        const tokens = aiNameTokens(row);
+        if (tokens.length === 0) continue;
+        const letters = tokens.join('').length;
+        if (letters < 4) continue;
+        if (tokens.every(t => qTokens.some(q => aiWordMatch(q, t)))) {
+            found.push({ row, tokens, score: tokens.length * 100 + letters });
+        }
+    }
+    // убираем «короткие» совпадения, которые целиком покрыты более длинным названием
+    found = found.filter(f => !found.some(g =>
+        g !== f && g.tokens.length > f.tokens.length &&
+        f.tokens.every(t => g.tokens.some(u => aiWordMatch(t, u)))));
+    found.sort((a, b) => b.score - a.score);
+    let rows = found.slice(0, 6).map(f => f.row);
+
+    // 2) запасной вариант: нечёткий поиск по очищенному вопросу (опечатки и т.п.)
+    if (rows.length === 0) {
+        const cleaned = aiNorm(text).split(' ').filter(w => w && !AI_STOP_WORDS.has(w) && !AI_FUNC_WORDS.has(w)).join(' ');
+        if (cleaned.length >= 4) {
+            rows = searchIndex.search(cleaned, { limit: 3, includeScore: true })
+                .filter(r => r.score !== undefined && r.score <= 0.25)
+                .map(r => r.item);
+        }
+    }
+    return rows;
+}
+
+const AI_ROW_SKIP = new Set(['__cat', 'id', 'name', 'icon_row', 'icon_col', 'created_at', 'updated_at', 'order_index']);
+
+function aiRowToText(row) {
+    const cat = row.__cat;
+    const parts = ['[' + cat.label.replace(/^\S+\s/, '') + '] ' + (row.name || ('#' + row.id))];
+    for (const [k, v] of Object.entries(row)) {
+        if (AI_ROW_SKIP.has(k)) continue;
+        if (v === null || v === undefined || v === '' || v === 0 || (Array.isArray(v) && v.length === 0)) continue;
+        let val = typeof v === 'object' ? JSON.stringify(v) : String(v);
+        if (val.length > 500) val = val.slice(0, 497) + '...';
+        parts.push(k + ': ' + val);
+    }
+    const linkId = cat.param === 'set' ? (row.set_id ?? row.id) : row.id;
+    parts.push('ссылка: ' + SITE_URL + cat.appPath + '?' + cat.param + '=' + linkId + '&open=modal');
+    let text = parts.join('; ');
+    if (text.length > 1300) text = text.slice(0, 1297) + '...';
+    return text;
+}
+
+// Собирает дополнение к системному промпту под конкретный вопрос
+function aiBuildKnowledge(question, context) {
+    const rows = aiFindEntries(question + (context ? ' ' + context : ''));
+    let extra = '';
+    if (AI_KNOWLEDGE) {
+        extra += '\n\nОБЩИЕ СВЕДЕНИЯ ОБ ИГРЕ И САЙТЕ (можно опираться на них):\n' + AI_KNOWLEDGE;
+    }
+    if (rows === null) return { extra, grounded: false, names: [] };
+
+    if (rows.length > 0) {
+        let ctx = '';
+        for (const r of rows) {
+            const line = aiRowToText(r) + '\n';
+            if (ctx.length + line.length > 4500) break;
+            ctx += line;
+        }
+        extra += '\n\nДАННЫЕ ИЗ БАЗЫ САЙТА по этому вопросу (единственный достоверный источник по игре):\n' + ctx +
+            '\nПРАВИЛА ДЛЯ ЭТОГО ОТВЕТА: отвечай ТОЧНО по этим данным. Названия, числа, уровни и свойства бери как есть, ' +
+            'ничего не выдумывай и не добавляй от себя знаний об игре. Если в данных нет ответа на часть вопроса ' +
+            '(например, нет рецепта или условий получения), прямо скажи, что в базе этого нет. ' +
+            'Подколка допустима, но данные нельзя искажать. Характеристики можно перечислять простыми строками без Markdown, ' +
+            'ответ может быть длиннее трёх предложений, но без воды. Если уместно, в конце дай ссылку на карточку из данных.';
+        return { extra, grounded: true, names: rows.map(r => r.name) };
+    }
+
+    extra += '\n\nПО ЭТОМУ ВОПРОСУ В БАЗЕ САЙТА НИЧЕГО НЕ НАЙДЕНО. ПРАВИЛА ДЛЯ ЭТОГО ОТВЕТА: ' +
+        'если ответ есть в общих сведениях выше, отвечай по ним. Если вопрос про конкретные игровые факты ' +
+        '(рецепты, уровни, характеристики, где что взять, механики), НЕ выдумывай: скажи в своём стиле, что в базе ' +
+        'такого не нашлось, и предложи написать точное название предмета. ' +
+        'Если вопрос не про такие факты (болтовня, шутка, мнение, общие вопросы не по игре), отвечай свободно, как хочешь.';
+    return { extra, grounded: false, names: [] };
+}
+
 // Общая логика: проверки, лимиты, запрос к ИИ, отправка ответа.
 // context — предыдущая реплика бота (если человек отвечает на сообщение бота).
 async function runAiQuestion(msg, question, context) {
@@ -1368,7 +1503,11 @@ async function runAiQuestion(msg, question, context) {
 
     bot.sendChatAction(chatId, 'typing').catch(() => {});
     try {
-        let answer = await askAI(question, context, msg.from && msg.from.first_name);
+        const kb = aiBuildKnowledge(question, context);
+        console.log('ИИ-поиск по базе: ' + (kb.names.length ? 'найдено ' + kb.names.join(', ') : 'ничего не найдено') +
+            ' | вопрос: ' + question.slice(0, 80));
+        let answer = await askAI(question, context, msg.from && msg.from.first_name,
+            { extraSystem: kb.extra, temperature: kb.grounded ? 0.3 : 1.0 });
         if (!answer) {
             bot.sendMessage(chatId, '🤔 Модель промолчала. Попробуй спросить иначе.', { reply_to_message_id: msg.message_id }).catch(logSendErr);
             return;
@@ -1459,6 +1598,116 @@ bot.on('message', async (msg) => {
         if (question) await runAiQuestion(msg, question, context);
     } catch (e) {
         console.error('ai-chat:', e.message);
+    }
+});
+
+// ==================== ТЕГ АДМИНА: шуточные автоответы ====================
+// Когда в группе тегают (@username) кого-то из админов, бот отвечает случайной шуткой.
+// Отключить целиком: переменная окружения ADMIN_TAG_REPLIES=off.
+// В ответах: {admin} — имя тегнутого админа (без @, чтобы лишний раз его не пинговать),
+//            {user} — имя того, кто тегнул, {num} — случайный номер «тикета».
+
+const ADMIN_TAG_ENABLED = (process.env.ADMIN_TAG_REPLIES || 'on').toLowerCase() !== 'off';
+const ADMIN_TAG_COOLDOWN_MS = 60 * 1000;     // не чаще раза в минуту на группу, чтобы не спамить
+const ADMIN_LIST_TTL_MS = 5 * 60 * 1000;     // список админов группы кэшируем на 5 минут
+
+const ADMIN_TAG_REPLIES = [
+    'Пользователя нет, я за него. Что хотели?',
+    'Не пиши сюда.',
+    'Абонент временно недоступен. Оставьте сообщение после гудка. Бииип.',
+    '{admin} сейчас занят важным делом: ничего не делает.',
+    'Ваш запрос очень важен для нас. Пожалуйста, оставайтесь на линии. Время ожидания: примерно никогда.',
+    'Админ в отпуске, мозг в ремонте. Попробуйте позже.',
+    'Обращение №{num} принято в обработку и сразу закрыто. Спасибо, что обратились.',
+    'Я передам. Может быть. Когда-нибудь. Вряд ли.',
+    'Не тревожь {admin} по пустякам. А если не по пустякам, то тем более не тревожь.',
+    '{user}, прежде чем звать админа, попробуй написать «хелп». Я хотя бы отвечу.',
+    '{admin} услышал. Теперь он будет делать вид, что не услышал.',
+    'Ваше обращение зарегистрировано под номером 404. Статус: не найдено.',
+    'Админ спит. Не буди дракона.',
+    'Зачем звать админа, когда есть я? Я тоже ничего не умею, зато всегда онлайн.',
+    'Автоответчик. Нажмите 1, если вам всё равно. Нажмите 2, если вам не всё равно. Нажмите 3, чтобы перестать писать сюда.',
+    'Админ сейчас фармит. Не мешай человеку жить.',
+    '{admin} не может ответить, потому что боится вас.',
+    'Тегнул админа? Смелый поступок. Бесполезный, но смелый.',
+    'Если это срочно, перезвоните через неделю.',
+    'Пользователь {admin} временно перемещён в режим «не беспокоить». Вас это тоже касается, {user}.',
+    'Звонили? Ну хорошо. Мы вам не перезвоним.',
+    'Я бы позвал админа, но он сказал не будить его без повода. Твой повод так себе.',
+];
+
+const adminListCache = new Map(); // chatId -> { time, admins }
+const adminTagLastTime = new Map(); // chatId -> время последнего ответа
+let adminTagLastReply = -1;
+
+async function getChatAdminList(chatId) {
+    const cached = adminListCache.get(chatId);
+    if (cached && Date.now() - cached.time < ADMIN_LIST_TTL_MS) return cached.admins;
+    try {
+        const list = await bot.getChatAdministrators(chatId);
+        const admins = list
+            .filter(a => a.user && !a.user.is_bot)
+            .map(a => ({
+                id: a.user.id,
+                username: (a.user.username || '').toLowerCase(),
+                name: a.user.first_name || a.user.username || 'админ',
+            }));
+        adminListCache.set(chatId, { time: Date.now(), admins });
+        return admins;
+    } catch (e) {
+        console.error('getChatAdminList:', e.message);
+        return cached ? cached.admins : [];
+    }
+}
+
+// Возвращает админа, которого тегнули в сообщении (или null)
+function findTaggedAdmin(msg, admins) {
+    const text = msg.text || msg.caption || '';
+    const entities = msg.entities || msg.caption_entities || [];
+    for (const e of entities) {
+        let target = null;
+        if (e.type === 'text_mention' && e.user) {
+            target = admins.find(a => a.id === e.user.id);
+        } else if (e.type === 'mention') {
+            const uname = text.slice(e.offset, e.offset + e.length).replace(/^@/, '').toLowerCase();
+            target = admins.find(a => a.username && a.username === uname);
+        }
+        if (target) return target;
+    }
+    return null;
+}
+
+function pickAdminTagReply(adminName, userName) {
+    let i;
+    do { i = Math.floor(Math.random() * ADMIN_TAG_REPLIES.length); }
+    while (i === adminTagLastReply && ADMIN_TAG_REPLIES.length > 1);
+    adminTagLastReply = i;
+    return ADMIN_TAG_REPLIES[i]
+        .replace(/\{admin\}/g, adminName)
+        .replace(/\{user\}/g, userName)
+        .replace(/\{num\}/g, String(Math.floor(1000 + Math.random() * 9000)));
+}
+
+bot.on('message', async (msg) => {
+    try {
+        if (!ADMIN_TAG_ENABLED) return;
+        if (!isGroupChat(msg) || !msg.from || msg.from.is_bot) return;
+        const entities = msg.entities || msg.caption_entities || [];
+        if (!entities.some(e => e.type === 'mention' || e.type === 'text_mention')) return;
+
+        const chatId = msg.chat.id;
+        if (Date.now() - (adminTagLastTime.get(chatId) || 0) < ADMIN_TAG_COOLDOWN_MS) return;
+
+        const admins = await getChatAdminList(chatId);
+        if (admins.length === 0) return;
+        const target = findTaggedAdmin(msg, admins);
+        if (!target || target.id === msg.from.id) return; // себя тегнуть можно, бот не реагирует
+
+        adminTagLastTime.set(chatId, Date.now());
+        const text = pickAdminTagReply(target.name, msg.from.first_name || 'друг');
+        bot.sendMessage(chatId, text, { reply_to_message_id: msg.message_id }).catch(logSendErr);
+    } catch (e) {
+        console.error('admin-tag:', e.message);
     }
 });
 
