@@ -1608,7 +1608,8 @@ bot.on('message', async (msg) => {
 //            {user} — имя того, кто тегнул, {num} — случайный номер «тикета».
 
 const ADMIN_TAG_ENABLED = (process.env.ADMIN_TAG_REPLIES || 'on').toLowerCase() !== 'off';
-const ADMIN_TAG_COOLDOWN_MS = 60 * 1000;     // не чаще раза в минуту на группу, чтобы не спамить
+const ADMIN_TAG_COOLDOWN_MS = 60 * 1000;     // на одного и того же админа отвечаем не чаще раза в минуту
+const ADMIN_TAG_CHAT_GAP_MS = 10 * 1000;     // и не чаще раза в 10 секунд на всю группу (защита от флуда)
 const ADMIN_LIST_TTL_MS = 5 * 60 * 1000;     // список админов группы кэшируем на 5 минут
 
 const ADMIN_TAG_REPLIES = [
@@ -1635,6 +1636,19 @@ const ADMIN_TAG_REPLIES = [
     'Звонили? Ну хорошо. Мы вам не перезвоним.',
     'Я бы позвал админа, но он сказал не будить его без повода. Твой повод так себе.',
 ];
+
+// Когда админ тегнул сам себя
+const ADMIN_SELF_TAG_REPLIES = [
+    '{user}, ты сам себя тегнул. Зато точно дозвонился.',
+    'Сам себя тегаешь? Одиночество — страшная вещь. Держись, {user}.',
+    '{user}, ты в курсе, что ты сам админ? Я не буду отвечать, разбирайся сам.',
+    'Позвал сам себя и ждёшь ответа? Это уже диагноз, {user}.',
+    'Пользователь {user} звонит сам себе. Абонент занят. Абонент всегда занят.',
+];
+function pickSelfTagReply(userName) {
+    const t = ADMIN_SELF_TAG_REPLIES[Math.floor(Math.random() * ADMIN_SELF_TAG_REPLIES.length)];
+    return t.replace(/\{user\}/g, userName);
+}
 
 const adminListCache = new Map(); // chatId -> { time, admins }
 const adminTagLastTime = new Map(); // chatId -> время последнего ответа
@@ -1696,15 +1710,26 @@ bot.on('message', async (msg) => {
         if (!entities.some(e => e.type === 'mention' || e.type === 'text_mention')) return;
 
         const chatId = msg.chat.id;
-        if (Date.now() - (adminTagLastTime.get(chatId) || 0) < ADMIN_TAG_COOLDOWN_MS) return;
-
         const admins = await getChatAdminList(chatId);
         if (admins.length === 0) return;
         const target = findTaggedAdmin(msg, admins);
-        if (!target || target.id === msg.from.id) return; // себя тегнуть можно, бот не реагирует
+        if (!target) {
+            console.log('admin-tag: упоминание не совпало ни с одним админом. Админы группы: ' +
+                admins.map(a => a.username ? '@' + a.username : a.name).join(', '));
+            return;
+        }
 
-        adminTagLastTime.set(chatId, Date.now());
-        const text = pickAdminTagReply(target.name, msg.from.first_name || 'друг');
+        const now = Date.now();
+        if (now - (adminTagLastTime.get(chatId) || 0) < ADMIN_TAG_CHAT_GAP_MS) return;
+        const key = chatId + ':' + target.id;
+        if (now - (adminTagLastTime.get(key) || 0) < ADMIN_TAG_COOLDOWN_MS) return;
+        adminTagLastTime.set(chatId, now);
+        adminTagLastTime.set(key, now);
+
+        const userName = msg.from.first_name || 'друг';
+        const text = target.id === msg.from.id
+            ? pickSelfTagReply(userName)
+            : pickAdminTagReply(target.name, userName);
         bot.sendMessage(chatId, text, { reply_to_message_id: msg.message_id }).catch(logSendErr);
     } catch (e) {
         console.error('admin-tag:', e.message);
