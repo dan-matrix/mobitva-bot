@@ -1655,16 +1655,36 @@ function aiRowToText(row) {
     return text;
 }
 
+// Не отправляем одну и ту же карточку в один чат чаще, чем раз в 10 минут (кроме явной просьбы «покажи»)
+const AI_CARD_REPEAT_MS = 10 * 60 * 1000;
+const aiCardSentAt = new Map();
+function aiCardKey(chatId, row) { return chatId + '|' + (row.__cat ? row.__cat.label : '') + '|' + row.id; }
+function aiCardRecentlySent(chatId, row) {
+    const t = aiCardSentAt.get(aiCardKey(chatId, row));
+    return !!t && Date.now() - t < AI_CARD_REPEAT_MS;
+}
+function aiMarkCardSent(chatId, row) {
+    aiCardSentAt.set(aiCardKey(chatId, row), Date.now());
+    if (aiCardSentAt.size > 500) aiCardSentAt.delete(aiCardSentAt.keys().next().value);
+}
+
 // Собирает дополнение к системному промпту под конкретный вопрос
-function aiBuildKnowledge(question, context, history) {
-    let rows = aiFindEntries(question + (context ? ' ' + context : ''));
+function aiBuildKnowledge(question, context, history, chatId) {
+    // Порядок поиска: 1) сам вопрос (только совпадение ЗДЕСЬ даёт право на карточку); 2) реплика бота, на которую
+    // отвечают; 3) последние обмены в диалоге. Пункты 2 и 3 — только данные для ответа, карточку по ним не шлём,
+    // иначе название из прошлого ответа бота цепляло бы карточку к каждому следующему ответу.
+    let rows = aiFindEntries(question);
+    let fromDialog = false;
+    if (rows !== null && rows.length === 0 && context) {
+        const crows = aiFindEntries(String(context));
+        if (crows && crows.length > 0) { rows = crows.slice(0, 3); rows.strong = false; fromDialog = true; }
+    }
     // уточняющий вопрос без названия («а какой у неё урон?») — ищем предмет в последних сообщениях диалога
-    let fromHistory = false;
     if (rows !== null && rows.length === 0 && history && history.length > 0 && aiLooksFollowUp(question)) {
         // идём по последним обменам «вопрос → ответ», начиная с самого свежего (не больше трёх)
         for (let i = history.length - 2, n = 0; i >= 0 && n < 3; i -= 2, n++) {
             const hrows = aiFindEntries(history[i].content + ' ' + history[i + 1].content);
-            if (hrows && hrows.length > 0) { rows = hrows; rows.strong = false; fromHistory = true; break; }
+            if (hrows && hrows.length > 0) { rows = hrows.slice(0, 3); rows.strong = false; fromDialog = true; break; }
         }
     }
     let extra = '';
@@ -1681,25 +1701,29 @@ function aiBuildKnowledge(question, context, history) {
             if (ctx.length + line.length > 4500) break;
             ctx += line;
         }
+        // карточки: только по совпадению в самом вопросе и не чаще раза в 10 минут для одного и того же предмета в чате
+        const strongRows = (!fromDialog && rows.strong) ? rows.slice(0, 2) : [];
+        const cardRows = strongRows.filter(r => !aiCardRecentlySent(chatId, r));
+        const cardsFollow = cardRows.length > 0;
+        const rule2 = cardsFollow
+            ? '2) ПОЛНЫЙ СПИСОК ХАРАКТЕРИСТИК ПРЕДМЕТА НЕ ПЕРЕПИСЫВАЙ: бот сам пришлёт следом отдельное сообщение с точной ' +
+              'карточкой предмета (уровень, характеристики, уникальные свойства, ссылка). Поэтому отвечай только на сам вопрос ' +
+              '(уровень, как получить, рецепт, для чего нужен и т.п.). Если спросили про одну конкретную характеристику, ' +
+              'назови только её значение. Если просто просят рассказать о предмете, дай одну-две фразы и скажи, что карточка ниже. '
+            : '2) Карточку предмета бот в этот раз НЕ присылает (предмет уже обсуждался или был показан недавно), поэтому не ' +
+              'говори «карточка ниже». Отвечай на сам вопрос коротко; если просят характеристики, перечисли только нужные из ' +
+              'данных чётко по пунктам «Название: значение», не смешивая свойства разных предметов. ';
         extra += '\n\nДАННЫЕ ИЗ БАЗЫ САЙТА по этому вопросу (единственный достоверный источник по игре):\n' + ctx +
             '\nПРАВИЛА ДЛЯ ЭТОГО ОТВЕТА: ' +
             '1) Отвечай ТОЧНО по этим данным. Названия, числа, уровни и свойства бери как есть, ничего не выдумывай ' +
             'и не добавляй от себя знаний об игре. Если в данных нет ответа на часть вопроса (например, нет рецепта ' +
             'или условий получения), прямо скажи, что в базе этого нет. ' +
-            '2) ПОЛНЫЙ СПИСОК ХАРАКТЕРИСТИК ПРЕДМЕТА НЕ ПЕРЕПИСЫВАЙ: бот сам пришлёт следом отдельное сообщение с точной ' +
-            'карточкой предмета (уровень, характеристики, уникальные свойства, ссылка). Поэтому отвечай только на сам вопрос ' +
-            '(уровень, как получить, рецепт, для чего нужен и т.п.). Если спросили про одну конкретную характеристику, ' +
-            'назови только её значение. Если просто просят рассказать о предмете, дай одну-две фразы и скажи, что карточка ниже. ' +
+            rule2 +
             '3) Если речь о нескольких предметах, всегда называй, к какому предмету относится каждое число, и никогда ' +
             'не смешивай свойства разных предметов. Если просят сравнить предметы, сравни только названные характеристики ' +
             'в виде строк «Название: значение». ' +
-            '4) Ответ короткий и по делу, без воды, простым текстом без Markdown.' +
-            (fromHistory
-                ? ' 5) Этот предмет обсуждали выше в диалоге. Карточку в этот раз бот НЕ присылает, поэтому если просят ' +
-                  'характеристики, перечисли нужные из данных чётко по пунктам «Название: значение».'
-                : '');
-        const cardRows = rows.strong ? rows.slice(0, 2) : []; // карточки показываем только при совпадении по названию
-        return { extra, grounded: true, names: rows.map(r => r.name), cardRows, rows, strong: !!rows.strong };
+            '4) Ответ короткий и по делу, без воды, простым текстом без Markdown.';
+        return { extra, grounded: true, names: rows.map(r => r.name), cardRows, rows, strong: !!rows.strong && !fromDialog };
     }
 
     extra += '\n\nПО ЭТОМУ ВОПРОСУ В БАЗЕ САЙТА НИЧЕГО НЕ НАЙДЕНО. ПРАВИЛА ДЛЯ ЭТОГО ОТВЕТА: ' +
@@ -1814,6 +1838,42 @@ function aiLooksLikeStatDump(text) {
     return !!pairs && pairs.length >= 3;
 }
 
+// ----- Личный чат: диалог с ИИ вместо автоматического поиска предмета -----
+// В личке любое обычное сообщение по умолчанию ищет предмет. Но когда человек только что говорил с ИИ
+// (ответ ИИ или карточка по просьбе «покажи» за последние 5 минут), его следующие сообщения продолжают диалог,
+// а не запускают поиск и не сыплют карточками. Точное название предмета по-прежнему работает как обычный поиск.
+const AI_PRIVATE_DIALOG_MS = 5 * 60 * 1000;
+const aiPrivateDialogUntil = new Map(); // chatId -> время, до которого сообщения идут в диалог с ИИ
+
+// Сообщение состоит только из названия предмета (и, возможно, пары служебных слов)?
+function aiIsBareItemName(text) {
+    const rows = aiFindEntries(text);
+    if (!rows || rows.length === 0 || !rows.strong) return false;
+    const nameTokens = rows.slice(0, 2).flatMap(r => aiNameTokens(r));
+    return aiNorm(text).split(' ').filter(Boolean).every(w =>
+        AI_FUNC_WORDS.has(w) || nameTokens.some(t => aiWordMatch(aiStem(w), t)));
+}
+
+// true — сообщение обработано как разговор с ИИ; false — пусть обрабатывается как обычный поиск
+async function tryPrivateAiRouting(msg) {
+    if (!aiConfigured() || !msg.text) return false;
+    const chatId = msg.chat.id;
+    const call = matchAiCallsign(msg.text);               // «хелп, вопрос» работает и в личке
+    if (call) {
+        if (call.question) { await runAiQuestion(msg, call.question, null); }
+        else bot.sendMessage(chatId, AI_HELP_TEXT).catch(logSendErr);
+        return true;
+    }
+    const rt = msg.reply_to_message;
+    const replyToAi = !!(rt && botInfo && rt.from && rt.from.id === botInfo.id && aiMessageIds.has(`${chatId}:${rt.message_id}`));
+    const inDialog = Date.now() < (aiPrivateDialogUntil.get(chatId) || 0);
+    if ((replyToAi || inDialog) && !aiIsBareItemName(msg.text)) {
+        await runAiQuestion(msg, msg.text, replyToAi ? (rt.text || null) : null);
+        return true;
+    }
+    return false;
+}
+
 // Общая логика: проверки, лимиты, запрос к ИИ, отправка ответа.
 // context — предыдущая реплика бота (если человек отвечает на сообщение бота).
 async function runAiQuestion(msg, question, context) {
@@ -1840,11 +1900,15 @@ async function runAiQuestion(msg, question, context) {
 
     // антиспам: не чаще раза в 15 секунд на человека
     const now = Date.now();
-    if (userId && now - (aiCooldown.get(userId) || 0) < AI_COOLDOWN_MS) return;
+    if (userId && now - (aiCooldown.get(userId) || 0) < AI_COOLDOWN_MS) {
+        // в группе молчим (антиспам), а в личке человек ведёт диалог, поэтому объясняем, что надо чуть подождать
+        if (msg.chat.type === 'private') bot.sendMessage(chatId, '⏳ Не так быстро: подожди пару секунд и спроси ещё раз.').catch(logSendErr);
+        return;
+    }
     if (userId) aiCooldown.set(userId, now);
 
     const history = aiGetHistory(chatId);
-    const kb = aiBuildKnowledge(question, context, history);
+    const kb = aiBuildKnowledge(question, context, history, chatId);
     const userName = msg.from && msg.from.first_name;
     console.log('ИИ-поиск по базе: ' + (kb.names.length ? 'найдено ' + kb.names.join(', ') : 'ничего не найдено') +
         ' | вопрос: ' + question.slice(0, 80));
@@ -1859,10 +1923,12 @@ async function runAiQuestion(msg, question, context) {
         try {
             const cards = lookupKb.strong ? lookupKb.rows.slice(0, 2) : lookupKb.rows.slice(0, 1);
             const intro = aiLookupIntro(cards, lookupKb.strong);
-            await bot.sendMessage(chatId, intro, { reply_to_message_id: msg.message_id });
-            for (const row of cards) await sendEntryResult(chatId, row);
+            const introMsg = await bot.sendMessage(chatId, intro, { reply_to_message_id: msg.message_id });
+            rememberAiMessage(chatId, introMsg.message_id);
+            for (const row of cards) { await sendEntryResult(chatId, row); aiMarkCardSent(chatId, row); }
             aiRemember(chatId, userName, question,
                 intro + '\n[Следом бот отправил карточки предметов: ' + cards.map(r => r.name).join(', ') + ']');
+            if (msg.chat.type === 'private') aiPrivateDialogUntil.set(chatId, Date.now() + AI_PRIVATE_DIALOG_MS);
         } catch (e) {
             console.error('lookup:', e.message);
         }
@@ -1898,10 +1964,11 @@ async function runAiQuestion(msg, question, context) {
         // Точные характеристики выводит код (та же карточка, что и в /item), а не ИИ
         let note = '';
         if (kb.cardRows && kb.cardRows.length > 0) {
-            for (const row of kb.cardRows) await sendEntryResult(chatId, row);
+            for (const row of kb.cardRows) { await sendEntryResult(chatId, row); aiMarkCardSent(chatId, row); }
             note = '\n[Следом бот отправил карточки предметов: ' + kb.cardRows.map(r => r.name).join(', ') + ']';
         }
         aiRemember(chatId, userName, question, answer + note);
+        if (msg.chat.type === 'private') aiPrivateDialogUntil.set(chatId, Date.now() + AI_PRIVATE_DIALOG_MS);
     } catch (e) {
         console.error('ask:', e.message);
         bot.sendMessage(chatId, aiErrorToChatText(e)).catch(logSendErr);
@@ -2260,6 +2327,8 @@ bot.on('message', async (msg) => {
         await handleDomainCheck(msg);
         return;
     }
+
+    if (await tryPrivateAiRouting(msg)) return;
 
     const eggReply = matchEasterEgg(msg.text);
     if (eggReply) {
