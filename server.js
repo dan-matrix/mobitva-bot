@@ -558,6 +558,9 @@ app.listen(PORT, () => {
         { command: 'nytik_off', description: 'Выключить "нытика дня" (только админы)' },
         { command: 'ask', description: 'Спросить ИИ: /ask <вопрос>' },
         { command: 'aiinfo', description: 'Диагностика ИИ: модель, ошибки, тест (админы)' },
+        { command: 'problems', description: 'Сводка по проблемам игры из чата за сутки (админы)' },
+        { command: 'chatlog_on', description: 'Включить сохранение сообщений для сводки (админы)' },
+        { command: 'chatlog_off', description: 'Выключить сохранение и удалить сохранённое (админы)' },
         { command: 'ask_on', description: 'Включить ИИ-ответы в группе (только админы)' },
         { command: 'ask_off', description: 'Выключить ИИ-ответы в группе (только админы)' },
     ]).catch(err => console.error('Не удалось задать список команд:', err.message));
@@ -1762,7 +1765,7 @@ const AI_LOOKUP_STEMS = ['покаж', 'показ', 'найд', 'найт', 'с
 // мелкие слова-«наполнители», которые не меняют смысл просьбы
 const AI_LOOKUP_FILLERS = new Set(['что', 'за', 'такое', 'про', 'о', 'об', 'мне', 'пожалуйста', 'плиз', 'пж', 'а', 'ну', 'ка',
     'эй', 'давай', 'какие', 'какой', 'какая', 'какое', 'как', 'у', 'есть', 'вещь', 'вещи', 'предмет', 'предмета', 'штука', 'штуку',
-    'хелп', 'помощь', 'бот', 'мобитва', 'help', 'info']);
+    'хелп', 'помощь', 'бот', 'мобитва', 'help', 'джарвис', 'воевода', 'info']);
 // слова, по которым видно, что спрашивают о конкретном (уровень, рецепт, где взять…) — это уже вопрос для ИИ
 const AI_SPECIFIC_EXACT = new Set(['где', 'когда', 'сколько', 'почему', 'зачем', 'куда', 'откуда', 'лв', 'лвл', 'левел', 'чем',
     'можно', 'нужно', 'надо', 'лучше', 'хуже', 'или', 'vs', 'против']);
@@ -2232,6 +2235,349 @@ bot.on('message', async (msg) => {
         console.error('admin-tag:', e.message);
     }
 });
+
+// ==================== СВОДКА ПРОБЛЕМ ИЗ ЧАТА ====================
+// Админ группы включает сохранение сообщений (/chatlog_on). Бот хранит текст сообщений несколько дней,
+// и по запросу (/problems) или каждое утро (/problems_auto_on) ИИ составляет сводку: какие именно проблемы с игрой
+// обсуждали игроки за последние 24 часа. Расплывчатые жалобы без деталей («лагает», «виснет») не учитываются.
+// В сводке нет имён игроков: участники обезличены.
+//
+// Настройки (необязательные переменные окружения в Render):
+//   CHATLOG_RETENTION_DAYS — сколько дней хранить сообщения (по умолчанию 3, от 2 до 14)
+//   PROBLEMS_REPORT_HOUR   — час ежедневной сводки по местному времени (TZ_OFFSET_HOURS), по умолчанию 9
+
+const CHATLOG_RETENTION_DAYS = Math.min(Math.max(parseInt(process.env.CHATLOG_RETENTION_DAYS || '3', 10) || 3, 2), 14);
+const PROBLEMS_REPORT_HOUR = (() => { const h = parseInt(process.env.PROBLEMS_REPORT_HOUR || '9', 10); return h >= 0 && h <= 23 ? h : 9; })();
+const CHATLOG_MAX_TEXT = 600;                 // длина сохраняемого сообщения
+const PROBLEMS_COOLDOWN_MS = 5 * 60 * 1000;   // сводку по запросу не чаще раза в 5 минут на группу
+const PROBLEMS_MAX_INPUT_CHARS = 14000;       // сколько символов чата отдаём ИИ
+
+// ---------- настройки группы ----------
+const chatLogSettingsCache = new Map(); // chatId -> { time, row }
+async function getChatLogSettings(chatId) {
+    const c = chatLogSettingsCache.get(chatId);
+    if (c && Date.now() - c.time < 60 * 1000) return c.row;
+    let row = null;
+    try {
+        const { data, error } = await supabaseAdmin.from('chatlog_settings').select('*').eq('chat_id', chatId).maybeSingle();
+        if (error) console.error('getChatLogSettings:', error.message);
+        else row = data || null;
+    } catch (e) { console.error('getChatLogSettings:', e.message); }
+    chatLogSettingsCache.set(chatId, { time: Date.now(), row });
+    return row;
+}
+async function saveChatLogSettings(chatId, patch) {
+    const { error } = await supabaseAdmin.from('chatlog_settings').upsert([{ chat_id: chatId, ...patch }], { onConflict: 'chat_id' });
+    chatLogSettingsCache.delete(chatId);
+    if (error) console.error('saveChatLogSettings:', error.message);
+    return !error;
+}
+
+// ---------- запись сообщений (пачками, чтобы не нагружать базу) ----------
+const chatLogBuffer = [];
+async function flushChatLog() {
+    if (chatLogBuffer.length === 0) return;
+    const batch = chatLogBuffer.splice(0, chatLogBuffer.length);
+    const { error } = await supabaseAdmin.from('chat_log').upsert(batch, { onConflict: 'chat_id,message_id', ignoreDuplicates: true });
+    if (error) console.error('chat_log insert:', error.message);
+}
+setInterval(() => flushChatLog().catch(e => console.error('flushChatLog:', e.message)), 10 * 1000);
+
+async function cleanupChatLog() {
+    const cutoff = new Date(Date.now() - CHATLOG_RETENTION_DAYS * 24 * 3600 * 1000).toISOString();
+    const { error } = await supabaseAdmin.from('chat_log').delete().lt('sent_at', cutoff);
+    if (error) console.error('cleanupChatLog:', error.message);
+}
+setTimeout(() => cleanupChatLog().catch(() => {}), 60 * 1000);
+setInterval(() => cleanupChatLog().catch(() => {}), 60 * 60 * 1000);
+
+bot.on('message', async (msg) => {
+    try {
+        if (!isGroupChat(msg) || !msg.from || msg.from.is_bot) return;
+        const text = (msg.text || msg.caption || '').trim();
+        if (text.length < 2 || text.startsWith('/')) return;
+        const st = await getChatLogSettings(msg.chat.id);
+        if (!st || !st.enabled) return;
+        chatLogBuffer.push({
+            chat_id: msg.chat.id,
+            message_id: msg.message_id,
+            user_id: msg.from.id,
+            text: text.slice(0, CHATLOG_MAX_TEXT),
+            reply_to: msg.reply_to_message ? msg.reply_to_message.message_id : null,
+            sent_at: new Date((msg.date || Math.floor(Date.now() / 1000)) * 1000).toISOString(),
+        });
+        if (chatLogBuffer.length >= 50) flushChatLog().catch(() => {});
+        if (chatLogBuffer.length > 1000) chatLogBuffer.splice(0, chatLogBuffer.length - 1000);
+    } catch (e) {
+        console.error('chat-log:', e.message);
+    }
+});
+
+// ---------- подготовка чата для ИИ ----------
+// слова-признаки проблемы (ищем по нормализованному тексту: нижний регистр, ё→е)
+const PROBLEM_WORDS_RE = new RegExp('(' + [
+    'лаг', 'завис', 'виснет', 'виснут', 'висит', 'висят', 'фриз', 'тормоз', 'глюч', 'глюк', 'баг', 'ошибк',
+    'не работа', 'неработа', 'не грузит', 'не загруж', 'не открыва', 'не откро', 'не заход', 'не пуска', 'не отвеча',
+    'не начисл', 'не засчит', 'не получа', 'не получилось', 'не срабат', 'не дает', 'не выда', 'не отобража', 'вылет',
+    'выкидыва', 'крэш', 'краш', 'слета', 'пропал', 'пропад', 'исчез', 'недоступ', 'упал', 'лежит', 'отвали',
+    'не видн', 'не вижу', 'не доход', 'сломал', 'не принима', 'не сохран', 'не списа', 'списал', 'двойн', 'дубл',
+    'не могу', 'не удается',
+].join('|') + ')');
+
+const PROBLEM_LOCAL_TIME = (ms) => {
+    const d = new Date(ms + TZ_OFFSET_HOURS * 3600 * 1000);
+    return String(d.getUTCHours()).padStart(2, '0') + ':' + String(d.getUTCMinutes()).padStart(2, '0');
+};
+
+// Находит в чате «обсуждения проблем»: сообщения с признаками проблемы плюс контекст вокруг (там обычно и пишут подробности)
+function buildProblemClusters(rows) {
+    const hits = [];
+    rows.forEach((r, i) => { if (PROBLEM_WORDS_RE.test(aiNorm(r.text))) hits.push(i); });
+    const ts = rows.map(r => Date.parse(r.sent_at));
+    const windows = [];
+    for (const i of hits) {
+        let a = i, b = i;
+        while (a > 0 && i - a < 3 && ts[i] - ts[a - 1] <= 10 * 60 * 1000) a--;
+        while (b < rows.length - 1 && b - i < 8 && ts[b + 1] - ts[i] <= 20 * 60 * 1000) b++;
+        windows.push({ a, b, hit: i });
+    }
+    windows.sort((x, y) => x.a - y.a);
+    const merged = [];
+    for (const w of windows) {
+        const last = merged[merged.length - 1];
+        const overlaps = last && w.a <= last.b;
+        const adjacent = last && w.a === last.b + 1 && ts[w.a] - ts[last.b] <= 30 * 60 * 1000;
+        if (overlaps || adjacent) { last.b = Math.max(last.b, w.b); last.hits.push(w.hit); }
+        else merged.push({ a: w.a, b: w.b, hits: [w.hit] });
+    }
+    for (const c of merged) {
+        const users = new Set(c.hits.map(i => rows[i].user_id));
+        c.score = users.size * 2 + c.hits.length;
+    }
+    return { clusters: merged, hits };
+}
+
+// Расплывчатая жалоба: признак проблемы есть, а подробностей нет (3 слова или меньше): «лагает», «опять виснет»
+function isVagueComplaint(text) {
+    return aiNorm(text).split(' ').filter(Boolean).length <= 3;
+}
+
+// Убираем из текста то, что может раскрывать личность: @ники, ссылки, длинные номера
+function sanitizeForReport(text) {
+    return String(text)
+        .replace(/https?:\/\/\S+/gi, '[ссылка]')
+        .replace(/@\w{3,}/g, '@…')
+        .replace(/\+?\d[\d\s().-]{8,}\d/g, '[номер]')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+// Собирает текст для ИИ: самые «весомые» обсуждения, игроки обезличены (И1, И2…)
+function buildProblemsPrompt(rows) {
+    const { clusters, hits } = buildProblemClusters(rows);
+    const vague = hits.filter(i => isVagueComplaint(rows[i].text)).length;
+    // обсуждение, где нет ни одного развёрнутого сообщения (6+ слов), состоит из «лагает/виснет» и болтовни — ИИ там нечего разбирать
+    const meaningful = clusters.filter(c => rows.slice(c.a, c.b + 1).some(r => aiNorm(r.text).split(' ').filter(Boolean).length >= 6));
+    if (meaningful.length === 0) return { text: '', vague, clusterCount: 0 };
+
+    const sorted = [...meaningful].sort((x, y) => y.score - x.score);
+    const chosen = [];
+    let total = 0;
+    for (const c of sorted) {
+        const size = rows.slice(c.a, c.b + 1).reduce((n, r) => n + r.text.length + 18, 0);
+        if (total + size > PROBLEMS_MAX_INPUT_CHARS && chosen.length > 0) continue;
+        chosen.push(c); total += size;
+    }
+    chosen.sort((x, y) => x.a - y.a);
+
+    const labels = new Map();
+    const label = (uid) => { if (!labels.has(uid)) labels.set(uid, 'И' + (labels.size + 1)); return labels.get(uid); };
+    const blocks = chosen.map(c => rows.slice(c.a, c.b + 1).map(r =>
+        '[' + PROBLEM_LOCAL_TIME(Date.parse(r.sent_at)) + '] ' + label(r.user_id) + ': ' + sanitizeForReport(r.text)).join('\n'));
+    return { text: blocks.join('\n— другое обсуждение —\n'), vague, clusterCount: chosen.length };
+}
+
+const PROBLEMS_SYSTEM_PROMPT =
+    'Ты аналитик техподдержки браузерной игры «МоБитва». Ниже фрагменты чата игроков за сутки. Участники обезличены ' +
+    '(И1, И2…), время местное. Твоя задача: выделить КОНКРЕТНЫЕ проблемы с игрой, сайтом или ботом, о которых игроки ' +
+    'рассказывали с подробностями, и описать каждую так, чтобы разработчик сразу понял, что именно не работает. ' +
+    'ПРАВИЛА: ' +
+    '1) Полностью игнорируй расплывчатые жалобы без объяснений («лагает», «виснет», «не работает» без уточнения, что именно, ' +
+    'где и когда), даже если их много. Но если в обсуждении кто-то уточнил детали, используй эти детали. ' +
+    '2) Для каждой проблемы дай блок из четырёх строк. «Проблема:» короткое название. «Что именно не работает:» подробное ' +
+    'описание: какая функция, режим, страница или действие; что ожидали и что получили; текст ошибки, если приводили; ' +
+    'устройство, браузер или платформа, если названы; с какого времени и как часто; воспроизводится ли у других. ' +
+    '«Кого касается:» сколько разных игроков (по меткам И1, И2…) об этом писали: «один игрок» или «N игроков». ' +
+    '«Что известно о решении:» советы или обходные пути из чата, а если не обсуждалось, так и напиши. ' +
+    '3) Ничего не выдумывай: используй только то, что есть в сообщениях. Если какой-то детали нет, пиши «не уточнили». ' +
+    'Если не уверен, что это проблема игры (а не вопрос по механике, шутка или спор), не включай. ' +
+    '4) Не называй игроков по именам и меткам в тексте описания, не цитируй длинные куски; текст ошибки можно привести коротко. ' +
+    '5) Если несколько человек описывают одну и ту же проблему, объедини их в один блок. ' +
+    '6) Формат: простой текст без Markdown, проблемы пронумерованы (1., 2., …), в конце одна строка «Итого: N проблем(ы)». ' +
+    'Самые массовые и серьёзные проблемы ставь первыми. ' +
+    '7) Если подходящих подробно описанных проблем нет, напиши ровно: «Подробно описанных проблем за сутки не обнаружено.» ' +
+    'Пиши по-русски.';
+
+// Один запрос к ИИ (без истории диалога) с одним повтором при лимитах и сбоях
+async function aiCompleteSimple(system, user, temperature, maxTokens) {
+    for (let attempt = 1; ; attempt++) {
+        try {
+            const r = await aiRawRequest([{ role: 'system', content: system }, { role: 'user', content: user }], temperature, maxTokens, 60000);
+            return r.text;
+        } catch (e) {
+            aiLastError = { time: Date.now(), message: e.message };
+            console.error('ИИ (сводка): попытка ' + attempt + ' не удалась:', e.message);
+            if (attempt >= 2) throw e;
+            const retriable = e.status === 429 || e.status >= 500 || ['TimeoutError', 'AbortError', 'TypeError'].includes(e.name);
+            if (!retriable) throw e;
+            await aiSleep(Math.min(Math.max(e.retryAfterMs || 0, 3000), 10000));
+        }
+    }
+}
+
+// Читает сообщения группы за последние сутки (постранично: у Supabase лимит 1000 строк за запрос)
+async function fetchChatLast24h(chatId) {
+    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+    const rows = [];
+    for (let from = 0; from < 5000; from += 1000) {
+        const { data, error } = await supabaseAdmin.from('chat_log')
+            .select('message_id,user_id,text,sent_at')
+            .eq('chat_id', chatId).gte('sent_at', since)
+            .order('sent_at', { ascending: true }).order('message_id', { ascending: true })
+            .range(from, from + 999);
+        if (error) throw new Error('chat_log: ' + error.message);
+        rows.push(...data);
+        if (data.length < 1000) break;
+    }
+    return rows;
+}
+
+// Возвращает { ok, text } — готовый текст сводки (или объяснение, почему её нет)
+async function buildProblemsReport(chatId) {
+    const rows = await fetchChatLast24h(chatId);
+    if (rows.length < 5) {
+        return { ok: false, text: 'За последние 24 часа сохранено слишком мало сообщений (' + rows.length + '), анализировать нечего. ' +
+            'Возможно, сохранение включили недавно.' };
+    }
+    const prep = buildProblemsPrompt(rows);
+    const footer = '\n\n(Проанализировано сообщений: ' + rows.length + '. Расплывчатых жалоб без подробностей, которые не учитывались: ' + prep.vague + '.)';
+    if (!prep.text) {
+        return { ok: true, text: 'Подробно описанных проблем за сутки не обнаружено.' + footer };
+    }
+    if (!aiTakeSlot()) return { ok: false, text: '😴 Дневной лимит запросов к ИИ исчерпан, сводку соберу позже.' };
+    const answer = await aiCompleteSimple(PROBLEMS_SYSTEM_PROMPT, prep.text, 0.2, 2500);
+    if (!answer) return { ok: false, text: '🤔 Модель вернула пустой ответ. Попробуйте ещё раз позже.' };
+    return { ok: true, text: answer + footer };
+}
+
+// Telegram ограничивает сообщение 4096 символами — режем по строкам
+async function sendLongText(chatId, text, options) {
+    const parts = [];
+    let cur = '';
+    for (const line of text.split('\n')) {
+        if ((cur + '\n' + line).length > 3800 && cur) { parts.push(cur); cur = line; }
+        else cur = cur ? cur + '\n' + line : line;
+    }
+    if (cur) parts.push(cur);
+    for (let i = 0; i < parts.length; i++) await bot.sendMessage(chatId, parts[i], i === 0 ? options : undefined);
+}
+
+// ---------- команды ----------
+async function groupAdminOnly(msg, what) {
+    if (!isGroupChat(msg)) { bot.sendMessage(msg.chat.id, 'Эта команда работает только в групповом чате.').catch(logSendErr); return false; }
+    if (!(await isGroupAdmin(msg))) {
+        bot.sendMessage(msg.chat.id, '🔒 ' + what + ' могут только администраторы группы.').catch(logSendErr);
+        return false;
+    }
+    return true;
+}
+
+bot.onText(/^\/chatlog_on(?:@\w+)?$/, async (msg) => {
+    if (!(await groupAdminOnly(msg, 'Включать сохранение сообщений'))) return;
+    const ok = await saveChatLogSettings(msg.chat.id, { enabled: true, enabled_at: new Date().toISOString() });
+    bot.sendMessage(msg.chat.id, ok
+        ? '📝 Включено сохранение сообщений этой группы для сводки по проблемам игры.\n\n' +
+          'Что хранится: текст сообщений и внутренний номер отправителя (без имён), ' + CHATLOG_RETENTION_DAYS + ' дн., затем удаляется. ' +
+          'Что делает бот: раз в сутки (или по запросу админа) ИИ выделяет из чата проблемы с игрой. В сводке нет имён игроков. ' +
+          'Данные видит только бот.\n\n' +
+          'Сводка по запросу: /problems · ежедневная сводка: /problems_auto_on · выключить и удалить всё сохранённое: /chatlog_off'
+        : '❌ Не удалось сохранить настройку (выполнен ли в Supabase файл sql/007_chat_log.sql?).').catch(logSendErr);
+});
+
+bot.onText(/^\/chatlog_off(?:@\w+)?$/, async (msg) => {
+    if (!(await groupAdminOnly(msg, 'Выключать сохранение сообщений'))) return;
+    const ok = await saveChatLogSettings(msg.chat.id, { enabled: false, auto_report: false });
+    const { error } = await supabaseAdmin.from('chat_log').delete().eq('chat_id', msg.chat.id);
+    if (error) console.error('chatlog_off delete:', error.message);
+    bot.sendMessage(msg.chat.id, ok && !error
+        ? '🔕 Сохранение сообщений выключено, всё ранее сохранённое из этой группы удалено.'
+        : '❌ Не удалось полностью выключить или очистить (смотри логи).').catch(logSendErr);
+});
+
+const problemsLast = new Map(); // chatId -> время последней сводки
+bot.onText(/^\/problems(?:@\w+)?$/, async (msg) => {
+    if (!(await groupAdminOnly(msg, 'Запрашивать сводку по проблемам'))) return;
+    const chatId = msg.chat.id;
+    const st = await getChatLogSettings(chatId);
+    if (!st || !st.enabled) {
+        bot.sendMessage(chatId, 'Сохранение сообщений в этой группе выключено, анализировать нечего. Включить может админ: /chatlog_on').catch(logSendErr);
+        return;
+    }
+    if (!aiConfigured()) { bot.sendMessage(chatId, '🤖 ИИ пока не подключён к этому боту.').catch(logSendErr); return; }
+    if (Date.now() - (problemsLast.get(chatId) || 0) < PROBLEMS_COOLDOWN_MS) {
+        bot.sendMessage(chatId, '⏳ Сводку недавно уже собирали, подожди пару минут.').catch(logSendErr);
+        return;
+    }
+    problemsLast.set(chatId, Date.now());
+    await flushChatLog().catch(() => {});
+    bot.sendMessage(chatId, '⏳ Собираю сводку по проблемам за последние 24 часа...').catch(logSendErr);
+    try {
+        const report = await buildProblemsReport(chatId);
+        await sendLongText(chatId, (report.ok ? '📋 Сводка по проблемам за последние 24 часа\n\n' : '') + report.text, { disable_web_page_preview: true });
+    } catch (e) {
+        console.error('problems:', e.message);
+        problemsLast.delete(chatId);
+        bot.sendMessage(chatId, aiErrorToChatText(e)).catch(logSendErr);
+    }
+});
+
+async function handleProblemsAuto(msg, enabled) {
+    if (!(await groupAdminOnly(msg, 'Управлять ежедневной сводкой'))) return;
+    const st = await getChatLogSettings(msg.chat.id);
+    if (enabled && (!st || !st.enabled)) {
+        bot.sendMessage(msg.chat.id, 'Сначала включи сохранение сообщений: /chatlog_on').catch(logSendErr);
+        return;
+    }
+    const ok = await saveChatLogSettings(msg.chat.id, { auto_report: enabled });
+    bot.sendMessage(msg.chat.id, ok
+        ? (enabled ? '✅ Ежедневная сводка по проблемам включена: каждый день в ' + PROBLEMS_REPORT_HOUR + ':00 по местному времени бота.'
+                   : '🔕 Ежедневная сводка выключена.')
+        : '❌ Не удалось сохранить настройку.').catch(logSendErr);
+}
+bot.onText(/^\/problems_auto_on(?:@\w+)?$/, (msg) => handleProblemsAuto(msg, true));
+bot.onText(/^\/problems_auto_off(?:@\w+)?$/, (msg) => handleProblemsAuto(msg, false));
+
+// ---------- ежедневная сводка ----------
+async function runDailyProblemReports() {
+    const local = new Date(Date.now() + TZ_OFFSET_HOURS * 3600 * 1000);
+    if (local.getUTCHours() !== PROBLEMS_REPORT_HOUR || !aiConfigured()) return;
+    const today = local.toISOString().slice(0, 10);
+    const { data, error } = await supabaseAdmin.from('chatlog_settings').select('*').eq('enabled', true).eq('auto_report', true);
+    if (error) { console.error('runDailyProblemReports:', error.message); return; }
+    await flushChatLog().catch(() => {});
+    for (const row of data || []) {
+        if (row.last_report_date === today) continue;
+        await saveChatLogSettings(row.chat_id, { last_report_date: today }); // отмечаем заранее, чтобы не слать дважды
+        try {
+            const report = await buildProblemsReport(row.chat_id);
+            await sendLongText(row.chat_id, (report.ok ? '📋 Ежедневная сводка по проблемам (за последние 24 часа)\n\n' : '') + report.text, { disable_web_page_preview: true });
+        } catch (e) {
+            console.error('Ежедневная сводка для чата ' + row.chat_id + ':', e.message);
+        }
+        await aiSleep(3000);
+    }
+}
+setInterval(() => runDailyProblemReports().catch(e => console.error('runDailyProblemReports:', e.message)), 10 * 60 * 1000);
 
 // ==================== ПАСХАЛКИ И ПОДКОЛЫ ====================
 
