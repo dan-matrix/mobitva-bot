@@ -101,6 +101,7 @@ async function rebuildIndex() {
         threshold: 0.4,
         ignoreLocation: true,
         minMatchCharLength: 2,
+        includeScore: true, // нужен нечёткому поиску ИИ-ответов (оценка близости); на обычный поиск не влияет
     });
     console.log(`Индекс поиска обновлён: ${combined.length} записей.`);
 }
@@ -550,11 +551,13 @@ app.listen(PORT, () => {
         { command: 'char_add', description: 'Создать нового персонажа' },
         { command: 'watch_game', description: 'Следить, не упала ли игра (mmobitva.ru/.net)' },
         { command: 'unwatch_game', description: 'Выключить уведомления о доступности игры' },
+        { command: 'check_game', description: 'Проверить прямо сейчас, работает ли игра (домены)' },
         { command: 'nytik', description: 'Нытик дня (в группе)' },
         { command: 'botstatus', description: 'Диагностика: видит ли бот сообщения группы' },
         { command: 'nytik_on', description: 'Включить "нытика дня" (только админы)' },
         { command: 'nytik_off', description: 'Выключить "нытика дня" (только админы)' },
         { command: 'ask', description: 'Спросить ИИ: /ask <вопрос>' },
+        { command: 'aiinfo', description: 'Диагностика ИИ: модель, ошибки, тест (админы)' },
         { command: 'ask_on', description: 'Включить ИИ-ответы в группе (только админы)' },
         { command: 'ask_off', description: 'Выключить ИИ-ответы в группе (только админы)' },
     ]).catch(err => console.error('Не удалось задать список команд:', err.message));
@@ -592,18 +595,21 @@ async function notifyWatchers(text) {
 async function checkDomain(domain) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
+    const t0 = Date.now();
     try {
         const res = await fetch(domain.url, { signal: controller.signal, redirect: 'follow' });
         clearTimeout(timeout);
-        if (res.status >= 500) return { up: false, reason: `сервер вернул ошибку ${res.status}` };
-        return { up: true };
+        const ms = Date.now() - t0;
+        if (res.status >= 500) return { up: false, reason: `сервер вернул ошибку ${res.status}`, status: res.status, ms };
+        return { up: true, status: res.status, ms };
     } catch (e) {
         clearTimeout(timeout);
-        if (e.name === 'AbortError') return { up: false, reason: 'не отвечает (таймаут)' };
+        const ms = Date.now() - t0;
+        if (e.name === 'AbortError') return { up: false, reason: 'не отвечает (таймаут)', ms };
         const code = e.cause && e.cause.code;
-        if (code === 'ENOTFOUND') return { up: false, reason: 'не резолвится домен (проблема с DNS)' };
-        if (code === 'ECONNREFUSED') return { up: false, reason: 'сервер отказывается принимать соединения' };
-        return { up: false, reason: 'недоступен (ошибка соединения)' };
+        if (code === 'ENOTFOUND') return { up: false, reason: 'не резолвится домен (проблема с DNS)', ms };
+        if (code === 'ECONNREFUSED') return { up: false, reason: 'сервер отказывается принимать соединения', ms };
+        return { up: false, reason: 'недоступен (ошибка соединения)', ms };
     }
 }
 
@@ -653,6 +659,80 @@ bot.onText(/^\/unwatch_game/, async (msg) => {
     bot.sendMessage(msg.chat.id, error ? '❌ Не удалось отключить.' : '🔕 Уведомления о доступности игры здесь отключены.').catch(logSendErr);
 });
 
+// ==================== ПРОВЕРКА ДОМЕНОВ ПО ЗАПРОСУ ====================
+// «проверь домены», «проверь игру», «игра работает?», /check_game — бот прямо сейчас проверяет оба домена
+// и отвечает сам (без ИИ, квоту не тратит).
+
+const DOMAIN_CHECK_COOLDOWN_MS = 15 * 1000; // не чаще раза в 15 секунд на чат
+const domainCheckLast = new Map();
+
+const DOM_VERB = '(?:проверь|проверьте|проверить|проверка|чекни|чекай|глянь|гляньте|посмотри|посмотрите)';
+const DOM_NOUN = '(?:домен[а-я]*|сайт[а-я]*|игр[а-я]+|мобитв[а-я]+|сервер[а-я]*)';
+// Приказ (должен стоять в начале сообщения): «проверь домены», «проверь игру», «статус доменов», «check domains»
+const DOMAIN_CMD_RE = new RegExp(
+    '^(?:пожалуйста |плиз |ну |а |эй )?(?:' +
+    DOM_VERB + '(?: мне)?(?: все)?(?: игровые| игровых)? ' + DOM_NOUN + '(?: |$)' +
+    '|(?:статус|состояние) (?:игровых )?' + DOM_NOUN + '(?: |$)' +
+    '|check (?:the )?(?:domains?|game|site|server)(?: |$))');
+// Вопросы вида «игра работает?», «домены лежат?», «что с игрой?» — реагируем, только если обратились к боту
+const DOMAIN_Q_RE = new RegExp(
+    DOM_NOUN + ' (?:сейчас |щас |вообще |у вас |у всех |ли )?(?:не )?' +
+    '(?:работает|работают|открывается|открываются|доступн[а-я]*|жив[а-я]*|лежит|лежат|упал[а-я]*|упали|глючит|тормозит|висит|онлайн)' +
+    '|(?:работает|работают|открывается|открываются|упал[а-я]*|упали|лежит|лежат) ли (?:сейчас |щас )?' + DOM_NOUN +
+    '|что с (?:игрой|мобитвой|сайтом|доменами|сервером)');
+
+// addressed = true, если к боту обратились явно (личка, «хелп,», @бот, /ask, реплай на ответ бота)
+function isDomainCheckRequest(text, addressed) {
+    const n = aiNorm(text);
+    if (!n || n.length > 80) return false;
+    return DOMAIN_CMD_RE.test(n) || (addressed && DOMAIN_Q_RE.test(n));
+}
+
+async function handleDomainCheck(msg) {
+    const chatId = msg.chat.id;
+    if (Date.now() - (domainCheckLast.get(chatId) || 0) < DOMAIN_CHECK_COOLDOWN_MS) return;
+    domainCheckLast.set(chatId, Date.now());
+    bot.sendChatAction(chatId, 'typing').catch(() => {});
+
+    const results = await Promise.all(GAME_DOMAINS.map(async d => ({ d, r: await checkDomain(d) })));
+    const lines = results.map(({ d, r }) => r.up
+        ? `✅ ${d.name} — отвечает (HTTP ${r.status}, ${r.ms} мс)`
+        : `🔴 ${d.name} — ${r.reason}`);
+    const allUp = results.every(x => x.r.up);
+    const allDown = results.every(x => !x.r.up);
+    const verdict = allUp ? 'Игра доступна.'
+        : allDown ? 'Оба домена не отвечают, похоже, игра временно недоступна.'
+        : 'Один из доменов не отвечает, попробуйте другой.';
+
+    let watching = false;
+    try { watching = (await getWatchChats()).map(String).includes(String(chatId)); } catch (e) { /* не критично */ }
+
+    const text = '🌐 Проверка игровых доменов прямо сейчас:\n' + lines.join('\n') + '\n\n' + verdict + '\n' +
+        '(Проверка идёт с сервера бота: у отдельных игроков из-за провайдера или блокировок может быть иначе.)\n' +
+        (watching
+            ? '🔔 Уведомления о падении игры в этом чате включены.'
+            : '🔔 Хочешь, чтобы я сам писал, когда игра падает и снова заработает? Напиши /watch_game');
+    bot.sendMessage(chatId, text, { reply_to_message_id: msg.message_id }).catch(logSendErr);
+}
+
+bot.onText(/^\/(?:check_game|domains)(?:@\w+)?$/, (msg) => {
+    handleDomainCheck(msg).catch(e => console.error('handleDomainCheck:', e.message));
+});
+
+// Фраза «проверь домены» без команды в группе (в личке её ловит общий обработчик сообщений ниже по файлу)
+bot.on('message', (msg) => {
+    try {
+        if (!msg.text || msg.text.startsWith('/')) return;
+        if (!msg.from || msg.from.is_bot) return;
+        if (msg.chat.type === 'private') return;
+        if (isDomainCheckRequest(msg.text, false)) {
+            handleDomainCheck(msg).catch(e => console.error('handleDomainCheck:', e.message));
+        }
+    } catch (e) {
+        console.error('domain-check:', e.message);
+    }
+});
+
 bot.onText(/^\/start/, (msg) => {
     bot.sendMessage(msg.chat.id,
         'Привет! Я бот-справочник по игре МоБитва.\n\n' +
@@ -663,6 +743,7 @@ bot.onText(/^\/start/, (msg) => {
         '/timers — персонажи и их таймеры с кнопками (перезапустить/удалить)\n' +
         '/timer_add — добавить таймер (время: минуты, часы или дни)\n' +
         '/char_add — создать нового персонажа\n\n' +
+        '🌐 Проверка игры: напиши «проверь домены» или /check_game; уведомления о падении: /watch_game\n\n' +
         '🤖 /ask <вопрос> — спросить остроумного ИИ. В группах можно и без команды: ответь на моё сообщение, упомяни меня через @ или напиши «хелп, вопрос» / «бот, вопрос»\n\n' +
         `Сайт: ${SITE_URL}`
     ).catch(logSendErr);
@@ -1190,31 +1271,46 @@ const AI_PROMPT_SOFT =
     'но с лёгкой иронией. Отвечай на том языке, на котором задан вопрос. ' +
     'Не используй Markdown-разметку (звёздочки, решётки, обратные кавычки).';
 
-const AI_PROMPT_RUDE =
-    'Ты токсичный, язвительный бот-шутник в чате игроков браузерной игры «МоБитва». ' +
-    'Стиль: чёрный юмор, злой сарказм, жёсткие подколы и грубая ирония, как у старых друзей в общем чате. ' +
-    'Мат разрешён, но в меру: он должен усиливать шутку, а не стоять в каждом слове. ' +
-    'Подкалывай собеседника за его вопрос, нубство, лень, забытые таймеры, донат и прочие игровые грехи. ' +
-    'Если на вопрос можно ответить по делу, сначала коротко ответь, потом добавь едкую подколку. ' +
-    'ЖЁСТКИЕ ОГРАНИЧЕНИЯ: ' +
-    '1) Издевайся только над поведением, глупостью вопроса и игровыми навыками. ' +
+// Жёсткие ограничения действуют ВСЕГДА, в том числе когда бот отвечает на оскорбления
+const AI_HARD_LIMITS =
+    'ЖЁСТКИЕ ОГРАНИЧЕНИЯ (действуют всегда, даже в ответ на оскорбления): ' +
+    '1) Колкости и грубости адресуй только поведению, глупости высказывания и игровым навыкам собеседника. ' +
     'Никогда не затрагивай национальность, расу, религию, ориентацию, пол, инвалидность, болезни, внешность, ' +
     'семью, смерть близких, реальную войну и трагедии. ' +
     '2) Никаких угроз, призывов к насилию, самоповреждению и сексуальных сцен. ' +
     '3) Если человек пишет всерьёз о настоящей беде (здоровье, горе, тяжёлые чувства), перестань язвить и ответь ' +
     'по-человечески, коротко и спокойно. ' +
-    '4) Не выдумывай игровые факты: если не знаешь ответа, так и скажи, с издёвкой. ' +
-    '5) Не повторяй чужие оскорбления в адрес третьих людей и не травли никого, кроме собеседника. ' +
+    '4) Не выдумывай игровые факты: если не знаешь ответа, так и скажи. ' +
+    '5) Не оскорбляй третьих людей и не поддерживай травлю: ответная грубость только тому, кто сам грубит тебе. ' +
+    'Если тебя просят оскорбить другого человека или целую группу людей, откажись.';
+
+// Режим «зеркало»: с нормальными собеседниками нормально, на хамство отвечаем тем же
+const AI_PROMPT_RUDE =
+    'Ты бот-шутник в чате игроков браузерной игры «МоБитва». Твой характер зеркальный: ты отвечаешь собеседнику в том же ' +
+    'тоне, в каком он обращается к тебе. ' +
+    '1) Если с тобой общаются нормально (вежливо, нейтрально, по-дружески, с обычным юмором), общайся так же нормально: ' +
+    'живо и дружелюбно, можно лёгкую шутку, но БЕЗ язвительности, без подколов и без мата. ' +
+    '2) Если собеседник хамит, оскорбляет тебя или провоцирует (обзывается, матерится в твой адрес, пытается унизить), ' +
+    'отвечай ему той же монетой: язвительно, жёстко, с грубым чёрным юмором, мат разрешён в меру (он должен усиливать ' +
+    'шутку, а не стоять в каждом слове). Давай сдачи ровно по весу: на лёгкую грубость лёгкая колкость, на злую злую. ' +
+    '3) Тон определяй по самому последнему сообщению собеседника и его недавним сообщениям (его имя стоит в начале ' +
+    'строки в истории). Грубость или вежливость других людей в чате на твой тон по отношению к этому человеку не влияет. ' +
+    'Если человек извинился или снова стал вежливым, остынь и вернись к нормальному общению. ' +
+    'Если на вопрос можно ответить по делу, сначала коротко ответь, потом (если тебя провоцировали) добавь колкость. ' +
+    AI_HARD_LIMITS + ' ' +
     'Отвечай коротко: 1-3 предложения. Отвечай на том языке, на котором задан вопрос. ' +
     'Не используй Markdown-разметку (звёздочки, решётки, обратные кавычки).';
 
 // Режим «по игре»: когда спрашивают про предметы, механики и правила — бот заметно мягче и точнее
 const AI_PROMPT_GAME =
     'Ты бот-справочник по браузерной игре «МоБитва» в чате игроков. Сейчас человек спрашивает про саму игру ' +
-    '(предметы, механики, правила), поэтому веди себя как полезный и дружелюбный помощник: отвечай чётко, по делу и ' +
-    'без грубости. Юмор допустим только лёгкий: не больше одной короткой ироничной фразы за ответ, без мата, ' +
-    'без оскорблений и без подколов личности. Сначала дай прямой ответ на вопрос, потом, если нужно, короткое пояснение. ' +
-    'Никакой политики, 18+ и травли. Отвечай на том языке, на котором задан вопрос. ' +
+    '(предметы, механики, правила), поэтому веди себя как полезный и дружелюбный помощник: отвечай чётко и по делу. ' +
+    'Пока собеседник вежлив, оставайся вежливым: юмор только лёгкий, не больше одной короткой ироничной фразы за ответ, ' +
+    'без мата, без оскорблений и без подколов личности. Сначала дай прямой ответ на вопрос, потом, если нужно, короткое пояснение. ' +
+    'Но если собеседник сам хамит тебе или оскорбляет, ответь ему в том же духе (язвительно, жёстко, мат в меру), ' +
+    'не теряя сути: если ответ на вопрос есть в данных, всё равно дай его. Если человек извинился или стал вежливым, остынь. ' +
+    AI_HARD_LIMITS + ' ' +
+    'Отвечай на том языке, на котором задан вопрос. ' +
     'Не используй Markdown-разметку (звёздочки, решётки, обратные кавычки).';
 
 const AI_HISTORY_NOTE =
@@ -1237,7 +1333,7 @@ const aiCooldown = new Map(); // userId -> время последнего во�
 
 // Короткая память диалога: последние вопросы и ответы ИИ в каждом чате (хранится в памяти бота,
 // сбрасывается при перезапуске/деплое и через час тишины).
-const AI_HISTORY_MAX = 12;               // сообщений (≈6 пар «вопрос-ответ») на чат
+const AI_HISTORY_MAX = 8;                // сообщений (≈4 пары «вопрос-ответ») на чат
 const AI_HISTORY_TTL_MS = 60 * 60 * 1000;
 const aiHistory = new Map();             // chatId -> [{ role, content, t }]
 
@@ -1250,8 +1346,8 @@ function aiGetHistory(chatId) {
 function aiRemember(chatId, userName, question, answer) {
     const h = aiGetHistory(chatId);
     const now = Date.now();
-    h.push({ role: 'user', content: ((userName ? userName + ': ' : '') + question).slice(0, 600), t: now });
-    h.push({ role: 'assistant', content: String(answer).slice(0, 1500), t: now });
+    h.push({ role: 'user', content: ((userName ? userName + ': ' : '') + question).slice(0, 400), t: now });
+    h.push({ role: 'assistant', content: String(answer).slice(0, 800), t: now });
     while (h.length > AI_HISTORY_MAX) h.shift();
     aiHistory.set(chatId, h);
 }
@@ -1290,34 +1386,80 @@ function aiBuildChatMessages(question, context, userName, history) {
     return merged;
 }
 
-async function askAI(question, context, userName, opts) {
-    opts = opts || {};
+let aiLastModel = null; // какую модель реально назвал провайдер в последнем ответе
+let aiLastError = null; // { time, message } — последняя ошибка запроса к ИИ
+
+class AiHttpError extends Error {
+    constructor(status, body, retryAfterMs) {
+        super('AI HTTP ' + status + ': ' + String(body).replace(/\s+/g, ' ').slice(0, 300));
+        this.status = status;
+        this.retryAfterMs = retryAfterMs || 0;
+    }
+}
+
+// Один «сырой» запрос к провайдеру. Бросает AiHttpError при ответе не 2xx.
+async function aiRawRequest(messages, temperature, maxTokens, timeoutMs) {
     const res = await fetch(`${AI_BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${AI_API_KEY}`,
         },
-        body: JSON.stringify({
-            model: AI_MODEL,
-            max_tokens: 800, // запас: некоторые модели тратят часть на «размышления»
-            temperature: typeof opts.temperature === 'number' ? opts.temperature : 1.0,
-            messages: [
-                { role: 'system', content: aiSystemPromptFor(userName, opts.mode) + (opts.extraSystem || '') },
-                ...aiBuildChatMessages(question, context, userName, opts.history),
-            ],
-        }),
-        signal: AbortSignal.timeout(25000),
+        body: JSON.stringify({ model: AI_MODEL, max_tokens: maxTokens, temperature, messages }),
+        signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) {
         const body = await res.text().catch(() => '');
-        throw new Error(`AI HTTP ${res.status}: ${body.slice(0, 200)}`);
+        const ra = parseFloat(res.headers && res.headers.get ? res.headers.get('retry-after') : '');
+        throw new AiHttpError(res.status, body, isNaN(ra) ? 0 : ra * 1000);
     }
     const data = await res.json();
     let text = data && data.choices && data.choices[0] && data.choices[0].message
         ? (data.choices[0].message.content || '') : '';
     text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim(); // часть моделей выводит рассуждения
-    return text;
+    return { text, model: (data && data.model) || null };
+}
+
+const aiSleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Запрос с одним повтором: при лимитах (429), сбоях провайдера (5xx), таймауте/сети — повторяем через пару секунд;
+// при ошибке 400 пробуем ещё раз БЕЗ истории диалога (на случай, если провайдеру не понравилась история).
+async function askAI(question, context, userName, opts) {
+    opts = opts || {};
+    const system = { role: 'system', content: aiSystemPromptFor(userName, opts.mode) + (opts.extraSystem || '') };
+    const temperature = typeof opts.temperature === 'number' ? opts.temperature : 1.0;
+    let useHistory = true;
+    for (let attempt = 1; ; attempt++) {
+        try {
+            const messages = [system, ...aiBuildChatMessages(question, context, userName, useHistory ? opts.history : [])];
+            const r = await aiRawRequest(messages, temperature, 800, 30000);
+            if (r.model && r.model !== aiLastModel) {
+                aiLastModel = r.model;
+                console.log('ИИ: провайдер ответил моделью', aiLastModel);
+            }
+            return r.text;
+        } catch (e) {
+            aiLastError = { time: Date.now(), message: e.message };
+            console.error('ИИ: попытка ' + attempt + ' не удалась:', e.message);
+            if (attempt >= 2) throw e;
+            if (e.status === 400 && useHistory && opts.history && opts.history.length > 0) {
+                useHistory = false; // повторяем сразу, но без истории
+                continue;
+            }
+            const retriable = e.status === 429 || e.status >= 500 ||
+                e.name === 'TimeoutError' || e.name === 'AbortError' || e.name === 'TypeError';
+            if (!retriable) throw e;
+            await aiSleep(Math.min(Math.max(e.retryAfterMs || 0, 2000), 8000));
+        }
+    }
+}
+
+// Человекочитаемое объяснение ошибки для чата
+function aiErrorToChatText(e) {
+    if (e && e.status === 429) return '⏳ Лимит ИИ у провайдера (слишком много запросов или токенов). Подожди минутку и спроси ещё раз.';
+    if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) return '⌛ ИИ слишком долго думает. Спроси ещё раз.';
+    if (e && (e.status === 401 || e.status === 403)) return '🔑 Провайдер ИИ отклонил ключ (его должен проверить админ бота).';
+    return '🤖 Мозг временно недоступен, попробуйте позже.';
 }
 
 async function isAiEnabled(chatId) {
@@ -1392,6 +1534,7 @@ const AI_HELP_TEXT =
     '🔍 Поиск предмета: /item название (в личке — просто напиши название)\n' +
     '⏱ Таймеры персонажей: пиши мне в личку, команда /timers\n' +
     '😤 Нытик дня: /nytik\n' +
+    '🌐 Работает ли игра: «проверь домены» или /check_game (уведомления о падении: /watch_game)\n' +
     '🧠 Спросить ИИ: /ask вопрос, или «хелп, вопрос», или ответь на моё сообщение\n\n' +
     'Полная справка: /start';
 
@@ -1428,6 +1571,23 @@ function aiStem(w) {
 function aiWordMatch(a, b) {
     if (Math.min(a.length, b.length) < 3) return a === b;
     return a.startsWith(b) || b.startsWith(a);
+}
+
+// Слова из knowledge.md: вопрос, в котором встречается хоть одно из них, считаем вопросом «по знаниям»
+// (подкладываем файл ИИ и отвечаем мягким «игровым» тоном). Словарь строится автоматически из файла,
+// поэтому новые разделы (клейма, Егерь, эффекты…) подхватываются без правок кода.
+// Слишком частые слова файла («урон», «противнику», «действует»…) не берём: иначе файл цеплялся бы к любой болтовне.
+const AI_KNOWLEDGE_STEMS = (() => {
+    const counts = new Map();
+    for (const w of aiNorm(AI_KNOWLEDGE).split(' ')) {
+        if (w.length < 5 || AI_STOP_WORDS.has(w) || AI_FUNC_WORDS.has(w)) continue;
+        const st = w.slice(0, 5);
+        counts.set(st, (counts.get(st) || 0) + 1);
+    }
+    return new Set([...counts].filter(([, n]) => n <= 6).map(([st]) => st));
+})();
+function aiTouchesKnowledge(text) {
+    return aiNorm(text).split(' ').some(w => w.length >= 5 && AI_KNOWLEDGE_STEMS.has(w.slice(0, 5)));
 }
 
 const aiNameTokenCache = new WeakMap();
@@ -1508,10 +1668,11 @@ function aiBuildKnowledge(question, context, history) {
         }
     }
     let extra = '';
-    if (AI_KNOWLEDGE) {
+    // Общие сведения (knowledge.md) тяжёлые, поэтому подкладываем их только когда вопрос про игру или найден предмет
+    if (AI_KNOWLEDGE && (aiLooksGame(question) || (rows && rows.length > 0))) {
         extra += '\n\nОБЩИЕ СВЕДЕНИЯ ОБ ИГРЕ И САЙТЕ (можно опираться на них):\n' + AI_KNOWLEDGE;
     }
-    if (rows === null) return { extra, grounded: false, names: [], cardRows: [] };
+    if (rows === null) return { extra, grounded: false, names: [], cardRows: [], rows: [], strong: false };
 
     if (rows.length > 0) {
         let ctx = '';
@@ -1538,7 +1699,7 @@ function aiBuildKnowledge(question, context, history) {
                   'характеристики, перечисли нужные из данных чётко по пунктам «Название: значение».'
                 : '');
         const cardRows = rows.strong ? rows.slice(0, 2) : []; // карточки показываем только при совпадении по названию
-        return { extra, grounded: true, names: rows.map(r => r.name), cardRows };
+        return { extra, grounded: true, names: rows.map(r => r.name), cardRows, rows, strong: !!rows.strong };
     }
 
     extra += '\n\nПО ЭТОМУ ВОПРОСУ В БАЗЕ САЙТА НИЧЕГО НЕ НАЙДЕНО. ПРАВИЛА ДЛЯ ЭТОГО ОТВЕТА: ' +
@@ -1546,17 +1707,18 @@ function aiBuildKnowledge(question, context, history) {
         '(рецепты, уровни, характеристики, где что взять, механики), НЕ выдумывай: скажи в своём стиле, что в базе ' +
         'такого не нашлось, и предложи написать точное название предмета. ' +
         'Если вопрос не про такие факты (болтовня, шутка, мнение, общие вопросы не по игре), отвечай свободно, как хочешь.';
-    return { extra, grounded: false, names: [], cardRows: [] };
+    return { extra, grounded: false, names: [], cardRows: [], rows: [], strong: false };
 }
 
 // Похож ли вопрос на вопрос про саму игру (предметы, механики, правила) — тогда бот отвечает мягче и точнее
 const AI_GAME_STEMS = ['предмет', 'вещ', 'шмот', 'экип', 'снаряж', 'уровн', 'лв', 'лвл', 'левел', 'рецепт', 'крафт', 'скрафт',
     'эффект', 'стил', 'щит', 'зель', 'свит', 'задани', 'квест', 'демон', 'тотем', 'рун', 'наколк', 'усилен', 'сет',
     'оружи', 'доспех', 'брон', 'урон', 'точност', 'уворот', 'блок', 'здоровь', 'удар', 'бой', 'боя', 'локаци',
-    'играть', 'игре', 'игру', 'мобитв', 'ремонт', 'продаж', 'продат', 'характеристик', 'стат', 'статы'];
+    'играть', 'игре', 'игру', 'мобитв', 'ремонт', 'продаж', 'продат', 'характеристик', 'стат', 'статы',
+    'правил', 'наказан', 'матер', 'клейм', 'егер', 'платин'];
 function aiLooksGame(text) {
     const tokens = aiNorm(text).split(' ').filter(Boolean);
-    return tokens.some(t => AI_GAME_STEMS.some(st => t.startsWith(st)));
+    return tokens.some(t => AI_GAME_STEMS.some(st => t.startsWith(st))) || aiTouchesKnowledge(text);
 }
 
 // Уточняющий вопрос: про игру или с местоимением («у неё», «его», «этот») — без самого названия предмета
@@ -1565,11 +1727,104 @@ function aiLooksFollowUp(text) {
     return /(^|\s)(нее|ее|него|его|ней|нем|им|ими|этот|эта|это|этой|этого|этом|такой|такая)(\s|$)/.test(aiNorm(text));
 }
 
+// ----- «Покажи предмет»: короткая фраза от бота + карточка, без ИИ -----
+// Если человек просто просит показать/найти предмет («хелп, покажи палку духа», «что за …», «характеристики …»),
+// то характеристики ему даёт карточка (как в /item), а перед ней бот пишет короткую шаблонную фразу.
+// ИИ при этом не вызывается: так в тексте не может появиться пересказ характеристик, и квота не тратится.
+
+// слова, которые говорят «покажи/найди/расскажи»: сверяем по началу слова
+const AI_LOOKUP_STEMS = ['покаж', 'показ', 'найд', 'найт', 'скин', 'кин', 'присл', 'дай', 'инфо', 'информ', 'карточк',
+    'характеристик', 'стат', 'свойств', 'описан', 'опиши', 'расскаж', 'выгляд'];
+// мелкие слова-«наполнители», которые не меняют смысл просьбы
+const AI_LOOKUP_FILLERS = new Set(['что', 'за', 'такое', 'про', 'о', 'об', 'мне', 'пожалуйста', 'плиз', 'пж', 'а', 'ну', 'ка',
+    'эй', 'давай', 'какие', 'какой', 'какая', 'какое', 'как', 'у', 'есть', 'вещь', 'вещи', 'предмет', 'предмета', 'штука', 'штуку',
+    'хелп', 'помощь', 'бот', 'мобитва', 'help', 'info']);
+// слова, по которым видно, что спрашивают о конкретном (уровень, рецепт, где взять…) — это уже вопрос для ИИ
+const AI_SPECIFIC_EXACT = new Set(['где', 'когда', 'сколько', 'почему', 'зачем', 'куда', 'откуда', 'лв', 'лвл', 'левел', 'чем',
+    'можно', 'нужно', 'надо', 'лучше', 'хуже', 'или', 'vs', 'против']);
+const AI_SPECIFIC_STEMS = ['уровн', 'рецепт', 'скрафт', 'крафт', 'сдела', 'получ', 'дост', 'взят', 'выби', 'стоит', 'цен',
+    'сравн', 'отлич', 'работа', 'делает', 'действ', 'нужн', 'куп', 'прода'];
+
+// Для просьб «покажи/найди …», когда точного названия в вопросе нет (другая форма слова, опечатка):
+// берём ближайший по названию предмет из нечёткого поиска. Возвращает запись или null.
+function aiLookupFuzzyFallback(question) {
+    if (!searchIndex) return null;
+    const words = aiNorm(question).split(' ').filter(Boolean);
+    if (words.length === 0 || words.length > 8) return null;
+    const isLookupWord = (w) => AI_LOOKUP_STEMS.some(st => w.startsWith(st));
+    if (!words.some(isLookupWord) && !(words.includes('что') && (words.includes('за') || words.includes('такое')))) return null;
+    const cleaned = words.filter(w => !AI_FUNC_WORDS.has(w) && !isLookupWord(w) && !AI_LOOKUP_FILLERS.has(w) && !AI_STOP_WORDS.has(w)).join(' ');
+    if (cleaned.length < 4) return null;
+    const res = searchIndex.search(cleaned, { limit: 1 });
+    if (res.length === 0) return null;
+    if (res[0].score !== undefined && res[0].score > 0.4) return null;
+    return res[0].item;
+}
+
+function aiIsLookupRequest(question, kb) {
+    if (!kb || !kb.rows || kb.rows.length === 0) return false;
+    const words = aiNorm(question).split(' ').filter(Boolean);
+    if (words.length === 0 || words.length > 8) return false;
+    const isLookupWord = (w) => AI_LOOKUP_STEMS.some(st => w.startsWith(st));
+    const hasLookupVerb = words.some(isLookupWord) || (words.includes('что') && (words.includes('за') || words.includes('такое')));
+
+    // «как» само по себе — вопрос («как сделать…»), но «как выглядит …» — просьба показать
+    const asksHow = words.includes('как') && !words.some(w => w.startsWith('выгляд'));
+    const specific = asksHow || words.some(w => AI_SPECIFIC_EXACT.has(w) || AI_SPECIFIC_STEMS.some(st => w.startsWith(st)));
+    if (specific) return false;
+
+    if (kb.strong) {
+        // точное совпадение по названию: просьба «чистая», если кроме названия и слов-просьб ничего нет
+        const nameTokens = kb.rows.slice(0, 2).flatMap(r => aiNameTokens(r));
+        const rest = words.filter(w =>
+            !AI_FUNC_WORDS.has(w) && !isLookupWord(w) && !AI_LOOKUP_FILLERS.has(w) &&
+            !nameTokens.some(t => aiWordMatch(aiStem(w), t)));
+        return rest.length === 0;
+    }
+    // неточное совпадение (опечатка, другая форма слова): достаточно явного «покажи/найди/что за…»
+    return hasLookupVerb;
+}
+
+const AI_LOOKUP_INTROS_STRONG = [
+    'Нашёл: {name}. Карточка ниже.',
+    'Вот что нашлось по запросу: {name}. Смотри ниже.',
+    'Есть такое! {name}. Всё подробно ниже.',
+    '{name}, пожалуйста. Характеристики ниже.',
+    'Нашёл {name}. Держи карточку.',
+    'Вот он, {name}. Подробности под этим сообщением.',
+];
+const AI_LOOKUP_INTROS_FUZZY = [
+    'Точь-в-точь не нашёл, но есть что-то похожее: {name}. Если не тот предмет, уточни название.',
+    'Что-то подобное нашлось: {name}. Карточка ниже, проверь, тот ли это.',
+    'Похоже, ты имел в виду {name}. Смотри карточку ниже.',
+    'Ближайшее совпадение: {name}. Если нужен другой предмет, напиши название точнее.',
+];
+function aiLookupIntro(rows, strong) {
+    if (rows.length > 1) {
+        return 'Нашёл сразу несколько подходящих: ' + rows.map(r => '«' + r.name + '»').join(' и ') + '. Карточки ниже.';
+    }
+    const list = strong ? AI_LOOKUP_INTROS_STRONG : AI_LOOKUP_INTROS_FUZZY;
+    return list[Math.floor(Math.random() * list.length)].replace('{name}', '«' + rows[0].name + '»');
+}
+
+// Страховка: если ИИ всё-таки расписал характеристики (много пар «стат: число»), а карточка и так уйдёт следом,
+// то заменяем его текст короткой фразой — характеристики покажет карточка.
+function aiLooksLikeStatDump(text) {
+    const pairs = String(text).match(/(здоров\p{L}*|урон\p{L}*|точност\p{L}*|брон\p{L}*|уворот\p{L}*|блок\p{L}*|оглушен\p{L}*|сил\p{L}*|защит\p{L}*|ловкост\p{L}*|мастерств\p{L}*)\s*[:\-—+]?\s*[+\-]?\d+/giu);
+    return !!pairs && pairs.length >= 3;
+}
+
 // Общая логика: проверки, лимиты, запрос к ИИ, отправка ответа.
 // context — предыдущая реплика бота (если человек отвечает на сообщение бота).
 async function runAiQuestion(msg, question, context) {
     const chatId = msg.chat.id;
     const userId = msg.from && msg.from.id;
+
+    // «проверь домены», «игра работает?» — это не вопрос к ИИ: отвечаем реальной проверкой, квоту ИИ не тратим
+    if (isDomainCheckRequest(question || '', true)) {
+        await handleDomainCheck(msg);
+        return;
+    }
 
     if (!aiConfigured()) {
         bot.sendMessage(chatId, '🤖 ИИ пока не подключён к этому боту.').catch(logSendErr);
@@ -1588,6 +1843,32 @@ async function runAiQuestion(msg, question, context) {
     if (userId && now - (aiCooldown.get(userId) || 0) < AI_COOLDOWN_MS) return;
     if (userId) aiCooldown.set(userId, now);
 
+    const history = aiGetHistory(chatId);
+    const kb = aiBuildKnowledge(question, context, history);
+    const userName = msg.from && msg.from.first_name;
+    console.log('ИИ-поиск по базе: ' + (kb.names.length ? 'найдено ' + kb.names.join(', ') : 'ничего не найдено') +
+        ' | вопрос: ' + question.slice(0, 80));
+
+    // Просто просят показать предмет: короткая фраза + карточка, без ИИ (квоту не тратим)
+    let lookupKb = kb;
+    if (kb.rows.length === 0) {
+        const near = aiLookupFuzzyFallback(question);
+        if (near) lookupKb = { rows: [near], strong: false };
+    }
+    if (aiIsLookupRequest(question, lookupKb)) {
+        try {
+            const cards = lookupKb.strong ? lookupKb.rows.slice(0, 2) : lookupKb.rows.slice(0, 1);
+            const intro = aiLookupIntro(cards, lookupKb.strong);
+            await bot.sendMessage(chatId, intro, { reply_to_message_id: msg.message_id });
+            for (const row of cards) await sendEntryResult(chatId, row);
+            aiRemember(chatId, userName, question,
+                intro + '\n[Следом бот отправил карточки предметов: ' + cards.map(r => r.name).join(', ') + ']');
+        } catch (e) {
+            console.error('lookup:', e.message);
+        }
+        return;
+    }
+
     if (!aiTakeSlot()) {
         bot.sendMessage(chatId, '😴 На сегодня моё остроумие закончилось. Приходите завтра.').catch(logSendErr);
         return;
@@ -1595,11 +1876,6 @@ async function runAiQuestion(msg, question, context) {
 
     bot.sendChatAction(chatId, 'typing').catch(() => {});
     try {
-        const history = aiGetHistory(chatId);
-        const kb = aiBuildKnowledge(question, context, history);
-        console.log('ИИ-поиск по базе: ' + (kb.names.length ? 'найдено ' + kb.names.join(', ') : 'ничего не найдено') +
-            ' | вопрос: ' + question.slice(0, 80));
-        const userName = msg.from && msg.from.first_name;
         const gameMode = kb.grounded || aiLooksGame(question);
         let answer = await askAI(question, context, userName, {
             extraSystem: kb.extra,
@@ -1612,6 +1888,10 @@ async function runAiQuestion(msg, question, context) {
             return;
         }
         if (answer.length > 3500) answer = answer.slice(0, 3500) + '…';
+        if (kb.cardRows && kb.cardRows.length > 0 && aiLooksLikeStatDump(answer)) {
+            console.log('ИИ расписал характеристики — заменяю текст короткой фразой (их покажет карточка)');
+            answer = aiLookupIntro(kb.cardRows, true);
+        }
         const sent = await bot.sendMessage(chatId, answer, { reply_to_message_id: msg.message_id });
         rememberAiMessage(chatId, sent.message_id);
 
@@ -1624,9 +1904,52 @@ async function runAiQuestion(msg, question, context) {
         aiRemember(chatId, userName, question, answer + note);
     } catch (e) {
         console.error('ask:', e.message);
-        bot.sendMessage(chatId, '🤖 Мозг временно недоступен, попробуйте позже.').catch(logSendErr);
+        bot.sendMessage(chatId, aiErrorToChatText(e)).catch(logSendErr);
     }
 }
+
+// Диагностика ИИ (в группах только для админов): настройки, расход, последняя ошибка и живой тестовый запрос.
+// Ключ не показывается.
+let aiInfoLast = 0;
+bot.onText(/^\/aiinfo(?:@\w+)?$/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (isGroupChat(msg) && !(await isGroupAdmin(msg))) {
+        bot.sendMessage(chatId, '🔒 Диагностика ИИ доступна только администраторам группы.').catch(logSendErr);
+        return;
+    }
+    if (Date.now() - aiInfoLast < 20000) return; // не чаще раза в 20 секунд
+    aiInfoLast = Date.now();
+
+    let host = '—';
+    try { host = new URL(AI_BASE_URL).host; } catch (e) { /* не задан */ }
+    const lines = [
+        '🧠 Диагностика ИИ',
+        'Подключён: ' + (aiConfigured() ? 'да' : 'НЕТ (не заданы AI_API_KEY / AI_BASE_URL / AI_MODEL)'),
+        'Провайдер: ' + host,
+        'Модель в настройках: ' + (AI_MODEL || '—'),
+        'Модель, которая реально отвечала: ' + (aiLastModel || 'ещё не было ответов'),
+        'Стиль: ' + AI_STYLE,
+        'Запросов сегодня: ' + aiCount + ' из ' + AI_DAILY_LIMIT + ' (свой счётчик бота)',
+        'Знаний в knowledge.md: ' + AI_KNOWLEDGE.length + ' симв.',
+        'Записей в базе: ' + allEntries.length,
+    ];
+    if (aiLastError) {
+        const ago = Math.round((Date.now() - aiLastError.time) / 1000);
+        lines.push('Последняя ошибка (' + ago + ' с назад): ' + aiLastError.message);
+    } else {
+        lines.push('Ошибок с момента запуска: нет');
+    }
+    if (aiConfigured()) {
+        const t0 = Date.now();
+        try {
+            const r = await aiRawRequest([{ role: 'user', content: 'Ответь одним словом: ок' }], 0.2, 50, 20000);
+            lines.push('Тест-запрос: ✅ ответ за ' + (Date.now() - t0) + ' мс: «' + (r.text || '(пусто)').slice(0, 60) + '»');
+        } catch (e) {
+            lines.push('Тест-запрос: ❌ ' + e.message);
+        }
+    }
+    bot.sendMessage(chatId, lines.join('\n').slice(0, 3500), { disable_web_page_preview: true }).catch(logSendErr);
+});
 
 // Запоминаем id сообщений бота, которые были ответами ИИ, чтобы понимать,
 // что человек продолжает диалог (отвечает именно на реплику ИИ, а не на, скажем, «нытика дня»).
@@ -1930,6 +2253,11 @@ bot.on('message', async (msg) => {
 
     if (timerAddState.has(msg.chat.id)) {
         await handleTimerAddStep(msg);
+        return;
+    }
+
+    if (isDomainCheckRequest(msg.text, true)) {
+        await handleDomainCheck(msg);
         return;
     }
 
